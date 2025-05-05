@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 import os
 
 # 從環境變數獲取 Telegram Bot Token 和 Webhook URL
-TOKEN = os.getenv("8045772064:AAEE_R4LFgE3TpnPc5s5xA7vTqZnzcPJ4aQ")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 DEFAULT_URL = "https://cam.fujigoko.tv/livecam26/cam1_9892.jpg"
 
