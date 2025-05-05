@@ -3,8 +3,7 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, ApplicationBuilder
-from telegram.ext import Updater
+from telegram.ext import Application, CommandHandler, ContextTypes
 import os
 
 # 從環境變數獲取 Telegram Bot Token 和 Webhook URL
@@ -90,7 +89,7 @@ async def send_images(chat_id: int, bot):
 
 async def main():
     # 初始化 Application
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
 
     # 添加命令處理器
     app.add_handler(CommandHandler("seturl", seturl))
@@ -111,5 +110,10 @@ async def main():
         webhook_url=WEBHOOK_URL
     )
 
+# 在現有事件循環中運行
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
