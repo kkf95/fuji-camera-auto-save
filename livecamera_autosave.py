@@ -87,27 +87,24 @@ async def send_images(chat_id: int, bot):
             print(f"錯誤: {e}")
         await asyncio.sleep(60)
 
-# 創建 Application 並設置 Webhook
-app = None  # 全局變數，用於儲存 ASGI 應用
+# 初始化 Application 並創建 ASGI 應用
+application = Application.builder().token(TOKEN).build()
+application.add_handler(CommandHandler("seturl", seturl))
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("resume", resume))
+application.add_handler(CommandHandler("stop", stop))
 
-async def setup_application():
-    global app
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("seturl", seturl))
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("resume", resume))
-    application.add_handler(CommandHandler("stop", stop))
-    
-    # 設置 Webhook
+# 設置 Webhook
+async def initialize_webhook():
     await application.bot.set_webhook(url=WEBHOOK_URL)
     print(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
-    
-    # 獲取 ASGI 應用
-    app = application.create_webhook_application()
-    return app
 
-# 啟動應用
+# 創建 ASGI 應用
+app = application.create_webhook_application()
+
+# 在啟動時設置 Webhook
+asyncio.run(initialize_webhook())
+
 if __name__ == "__main__":
     import uvicorn
-    asyncio.run(setup_application())
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8443)))
