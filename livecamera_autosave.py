@@ -3,7 +3,8 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, ApplicationBuilder
+from telegram.ext import Updater
 import os
 
 # 從環境變數獲取 Telegram Bot Token 和 Webhook URL
@@ -87,24 +88,28 @@ async def send_images(chat_id: int, bot):
             print(f"錯誤: {e}")
         await asyncio.sleep(60)
 
-# 初始化 Application 並創建 ASGI 應用
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("seturl", seturl))
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("resume", resume))
-application.add_handler(CommandHandler("stop", stop))
+async def main():
+    # 初始化 Application
+    app = ApplicationBuilder().token(TOKEN).build()
 
-# 設置 Webhook
-async def initialize_webhook():
-    await application.bot.set_webhook(url=WEBHOOK_URL)
+    # 添加命令處理器
+    app.add_handler(CommandHandler("seturl", seturl))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("resume", resume))
+    app.add_handler(CommandHandler("stop", stop))
+
+    # 設置 Webhook
+    await app.bot.set_webhook(url=WEBHOOK_URL)
     print(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
 
-# 創建 ASGI 應用
-app = application.create_webhook_application()
-
-# 在啟動時設置 Webhook
-asyncio.run(initialize_webhook())
+    # 啟動 Webhook
+    port = int(os.getenv("PORT", 8443))
+    await app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path="/webhook",
+        webhook_url=WEBHOOK_URL
+    )
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8443)))
+    asyncio.run(main())
