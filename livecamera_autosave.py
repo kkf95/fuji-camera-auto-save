@@ -97,6 +97,9 @@ async def main():
     app.add_handler(CommandHandler("resume", resume))
     app.add_handler(CommandHandler("stop", stop))
 
+    # 初始化應用
+    await app.initialize()
+
     # 設置 Webhook
     await app.bot.set_webhook(url=WEBHOOK_URL)
     print(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
@@ -110,10 +113,9 @@ async def main():
         webhook_url=WEBHOOK_URL
     )
 
-# 在現有事件循環中運行
+    # 清理
+    await app.shutdown()
+
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(main())
-    finally:
-        loop.close()
+    # 直接運行 main，不使用外層事件循環管理
+    asyncio.run(main())
