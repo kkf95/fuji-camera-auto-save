@@ -2,9 +2,10 @@ import asyncio
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, BotCommand
+from telegram.ext import Application, CommandHandler, ContextTypes, ApplicationBuilder
 import os
+from fastapi import FastAPI, Request, Response
 
 # 從環境變數獲取 Telegram Bot Token 和 Webhook URL
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -15,6 +16,12 @@ DEFAULT_URL = "https://cam.fujigoko.tv/livecam26/cam1_9892.jpg"
 running = False
 task = None
 current_url = DEFAULT_URL
+
+# FastAPI 應用
+fastapi_app = FastAPI()
+
+# Telegram Application
+telegram_app = None
 
 async def seturl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_url
@@ -87,35 +94,55 @@ async def send_images(chat_id: int, bot):
             print(f"錯誤: {e}")
         await asyncio.sleep(60)
 
-async def main():
+async def initialize_bot():
+    global telegram_app
     # 初始化 Application
-    app = Application.builder().token(TOKEN).build()
+    telegram_app = ApplicationBuilder().token(TOKEN).build()
 
     # 添加命令處理器
-    app.add_handler(CommandHandler("seturl", seturl))
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("resume", resume))
-    app.add_handler(CommandHandler("stop", stop))
+    telegram_app.add_handler(CommandHandler("seturl", seturl))
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("resume", resume))
+    telegram_app.add_handler(CommandHandler("stop", stop))
 
-    # 初始化應用
-    await app.initialize()
+    # 設置 Telegram 命令選單
+    commands = [
+        BotCommand("seturl", "設置圖片網址（例如 /seturl <網址>）"),
+        BotCommand("start", "開始每分鐘傳送圖片"),
+        BotCommand("resume", "恢復傳送圖片"),
+        BotCommand("stop", "停止傳送圖片")
+    ]
+    await telegram_app.bot.set_my_commands(commands)
+    print("Telegram 命令選單已設置")
 
     # 設置 Webhook
-    await app.bot.set_webhook(url=WEBHOOK_URL)
+    await telegram_app.bot.set_webhook(url=WEBHOOK_URL)
     print(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
 
-    # 啟動 Webhook
-    port = int(os.getenv("PORT", 8443))
-    await app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path="/webhook",
-        webhook_url=WEBHOOK_URL
-    )
+    # 初始化 Application
+    await telegram_app.initialize()
 
-    # 清理
-    await app.shutdown()
+# FastAPI Webhook 端點
+@fastapi_app.post("/webhook")
+async def webhook(request: Request):
+    global telegram_app
+    update = await request.json()
+    await telegram_app.process_update(Update.de_json(update, telegram_app.bot))
+    return Response(status_code=200)
+
+# 啟動時初始化 Bot
+@fastapi_app.on_event("startup")
+async def on_startup():
+    await initialize_bot()
+
+# 關閉時清理
+@fastapi_app.on_event("shutdown")
+async def on_shutdown():
+    global telegram_app
+    if telegram_app:
+        await telegram_app.shutdown()
 
 if __name__ == "__main__":
-    # 直接運行 main，不使用外層事件循環管理
-    asyncio.run(main())
+    import uvicorn
+    port = int(os.getenv("PORT", 8443))
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
