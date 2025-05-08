@@ -73,6 +73,7 @@ def seturl(update: Update, context: CallbackContext):
 
     user_page_url = new_url
     update.message.reply_text(f"網址已設定為：{new_url}\n使用 /start 開始傳送圖片。")
+    logger.info(f"網址設定為：{new_url}，聊天 ID：{update.effective_chat.id}")
 
 def start(update: Update, context: CallbackContext):
     global running, task
@@ -122,15 +123,19 @@ async def send_images(chat_id: int, bot):
         try:
             # 每次傳送前獲取最新圖片網址
             current_url = await get_latest_image_url(user_page_url)
-            url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
-            response = requests.get(url, timeout=10)
+            # 移除舊查詢參數，添加新時間戳
+            request_url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
+            logger.info(f"請求圖片網址：{request_url}")
+            response = requests.get(request_url, timeout=10)
             if response.status_code == 200:
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
                 caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} (Source: 富士五湖TV)"
-                await bot.send_photo(chat_id=chat_id, photo=response.content, caption=caption)
-                logger.info(f"圖片已傳送，網址：{current_url}，時間：{caption}，聊天 ID：{chat_id}")
+                logger.info(f"準備傳送圖片，聊天 ID：{chat_id}，caption：{caption}")
+                # 確保只 await 一次，且不對返回值再次 await
+                message = await bot.send_photo(chat_id=chat_id, photo=response.content, caption=caption)
+                logger.info(f"圖片傳送成功，網址：{current_url}，時間：{caption}，聊天 ID：{chat_id}")
             else:
-                logger.warning(f"無法下載圖片，網址：{current_url}，狀態碼：{response.status_code}")
+                logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
         except Exception as e:
             logger.error(f"傳送圖片失敗：{e}")
         await asyncio.sleep(60)
