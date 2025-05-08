@@ -8,6 +8,11 @@ from bs4 import BeautifulSoup
 import os
 from flask import Flask, request, Response
 import threading
+import logging
+
+# 設置日誌
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # 從環境變數獲取 Telegram Bot Token 和 Webhook URL
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -35,11 +40,12 @@ async def get_latest_image_url(page_url):
         soup = BeautifulSoup(response.text, "html.parser")
         img_tag = soup.find("img", id="mov")
         if img_tag and img_tag.get("src"):
+            logger.info(f"成功爬取圖片網址：{img_tag['src']}（頁面：{page_url}）")
             return img_tag["src"]
-        print(f"未找到圖片網址（頁面：{page_url}），使用預設圖片網址")
+        logger.warning(f"未找到圖片網址（頁面：{page_url}），使用預設圖片網址")
         return DEFAULT_IMAGE_URL
     except Exception as e:
-        print(f"爬取圖片網址失敗（頁面：{page_url}）: {e}")
+        logger.error(f"爬取圖片網址失敗（頁面：{page_url}）：{e}")
         return DEFAULT_IMAGE_URL
 
 def seturl(update: Update, context: CallbackContext):
@@ -81,6 +87,7 @@ def start(update: Update, context: CallbackContext):
         send_images(update.effective_chat.id, context.bot), loop
     )
     task = future
+    logger.info(f"啟動圖片傳送任務，聊天 ID：{update.effective_chat.id}")
 
 def resume(update: Update, context: CallbackContext):
     global running, task
@@ -95,6 +102,7 @@ def resume(update: Update, context: CallbackContext):
         send_images(update.effective_chat.id, context.bot), loop
     )
     task = future
+    logger.info(f"恢復圖片傳送任務，聊天 ID：{update.effective_chat.id}")
 
 def stop(update: Update, context: CallbackContext):
     global running, task
@@ -106,6 +114,7 @@ def stop(update: Update, context: CallbackContext):
     if task:
         task.cancel()
     update.message.reply_text("Bot 已停止。使用 /resume 恢復。")
+    logger.info("停止圖片傳送任務")
 
 async def send_images(chat_id: int, bot):
     global user_page_url
@@ -119,11 +128,11 @@ async def send_images(chat_id: int, bot):
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
                 caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} (Source: 富士五湖TV)"
                 await bot.send_photo(chat_id=chat_id, photo=response.content, caption=caption)
-                print(f"圖片已傳送，網址：{current_url}，時間：{caption}")
+                logger.info(f"圖片已傳送，網址：{current_url}，時間：{caption}，聊天 ID：{chat_id}")
             else:
-                print(f"無法下載圖片，網址：{current_url}，狀態碼：{response.status_code}")
+                logger.warning(f"無法下載圖片，網址：{current_url}，狀態碼：{response.status_code}")
         except Exception as e:
-            print(f"傳送圖片失敗: {e}")
+            logger.error(f"傳送圖片失敗：{e}")
         await asyncio.sleep(60)
 
 def initialize_bot():
@@ -146,11 +155,11 @@ def initialize_bot():
         ("resume", "恢復傳送圖片"),
         ("stop", "停止傳送圖片")
     ])
-    print("Telegram 命令選單已設置")
+    logger.info("Telegram 命令選單已設置")
 
     # 設置 Webhook
     updater.bot.set_webhook(WEBHOOK_URL)
-    print(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
+    logger.info(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
 
 def run_event_loop():
     """在獨立線程中運行事件循環"""
@@ -158,6 +167,32 @@ def run_event_loop():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_forever()
+    logger.info("事件循環已啟動")
+
+@flask_app.route("/webhook", methods=["POST"])
+def webhook():
+    global updater
+    logger.info("收到 Webhook 請求")
+    if updater is None:
+        logger.warning("Updater 未初始化，正在初始化")
+        initialize_bot()
+    try:
+        update = Update.de_json(request.get_json(), updater.bot)
+        if update:
+            updater.dispatcher.process_update(update)
+            logger.info("Webhook 請求處理成功")
+        else:
+            logger.warning("無效的 Webhook 請求")
+        return Response(status=200)
+    except Exception as e:
+        logger.error(f"處理 Webhook 請求失敗：{e}")
+        return Response(status=500)
+
+@flask_app.route("/", methods=["GET"])
+def health_check():
+    """健康檢查端點"""
+    logger.info("收到健康檢查請求")
+    return Response("Bot is running", status=200)
 
 if __name__ == "__main__":
     # 啟動事件循環線程
@@ -165,4 +200,5 @@ if __name__ == "__main__":
     # 初始化 Bot
     initialize_bot()
     port = int(os.getenv("PORT", 8443))
+    logger.info(f"啟動 Flask 伺服器，端口：{port}")
     flask_app.run(host="0.0.0.0", port=port)
