@@ -9,9 +9,17 @@ import os
 from flask import Flask, request, Response
 import threading
 import logging
+import sys
 
 # 設置日誌
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log', mode='a')
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # 從環境變數獲取 Telegram Bot Token 和 Webhook URL
@@ -19,7 +27,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 DEFAULT_PAGE_URL = "https://live.fujigoko.tv/?n=26&b=0"
 DEFAULT_IMAGE_URL = "https://cam.fujigoko.tv/livecam26/cam1_9892.jpg"
-DEFAULT_LOCATION = "富士山ライブカメラ-鳴沢村活き活き広場"
+DEFAULT_LOCATION = "鳴沢村活き活き広場"
 
 # 用於控制任務和儲存網址的全局變數
 running = False
@@ -34,21 +42,17 @@ flask_app = Flask(__name__)
 updater = None
 
 async def get_latest_image_url(page_url):
-    """從指定頁面爬取最新的圖片網址和地點名稱"""
+    """從指定頁面爬取圖片網址和地點名稱"""
     try:
-        headers = {"Cache-Control": "no-cache"}
-        response = requests.get(page_url, headers=headers, timeout=10)
+        response = requests.get(page_url, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        
         # 提取圖片網址
         img_tag = soup.find("img", id="mov")
         image_url = img_tag["src"] if img_tag and img_tag.get("src") else DEFAULT_IMAGE_URL
-        
         # 提取地點名稱
         location_tag = soup.find("span", class_="auto-style3")
-        location = location_tag.text.strip().lstrip("/ ").strip() if location_tag else DEFAULT_LOCATION
-        
+        location = location_tag.text.strip().replace("/ ", "") if location_tag else DEFAULT_LOCATION
         logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}（頁面：{page_url}）")
         return image_url, location
     except Exception as e:
@@ -121,66 +125,87 @@ def stop(update: Update, context: CallbackContext):
     running = False
     if task:
         task.cancel()
+        logger.info("任務已取消")
     update.message.reply_text("Bot 已停止。使用 /resume 恢復。")
     logger.info("停止圖片傳送任務")
 
 async def send_images(chat_id: int, bot):
-    global user_page_url
+    global user_page_url, running
+    logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
     while running:
         try:
-            # 每次傳送前獲取最新圖片網址和地點
+            # 獲取圖片網址和地點
             current_url, location = await get_latest_image_url(user_page_url)
             # 移除舊查詢參數，添加新時間戳
             request_url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
             logger.info(f"請求圖片網址：{request_url}")
-            headers = {"Cache-Control": "no-cache"}
-            response = requests.get(request_url, headers=headers, timeout=10)
+            response = requests.get(request_url, timeout=10)
             if response.status_code == 200:
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
                 caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: 富士五湖TV)"
                 logger.info(f"準備傳送圖片，聊天 ID：{chat_id}，caption：{caption}")
-                # 執行 send_photo，確保不對返回值誤用 await
+                # 執行圖片傳送
                 message = await bot.send_photo(chat_id=chat_id, photo=response.content, caption=caption)
-                logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}，聊天 ID：{chat_id}")
+                logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}，聊天 ID：{chat_id}，消息 ID：{message.message_id}")
             else:
                 logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
+        except asyncio.CancelledError:
+            logger.info(f"圖片傳送任務被取消，聊天 ID：{chat_id}")
+            running = False
+            break
         except Exception as e:
-            logger.error(f"傳送圖片失敗：{e}")
-        await asyncio.sleep(60)
+            logger.error(f"圖片傳送流程異常：{e}，繼續下一次循環")
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            logger.info(f"圖片傳送任務被取消（睡眠期間），聊天 ID：{chat_id}")
+            running = False
+            break
+    logger.info(f"圖片傳送循環結束，聊天 ID：{chat_id}")
 
 def initialize_bot():
     global updater
-    # 初始化 Updater
-    updater = Updater(TOKEN, use_context=True)
-    dispatcher = updater.dispatcher
+    try:
+        # 初始化 Updater
+        updater = Updater(TOKEN, use_context=True)
+        dispatcher = updater.dispatcher
 
-    # 添加命令處理器
-    dispatcher.add_handler(CommandHandler("seturl", seturl))
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("resume", resume))
-    dispatcher.add_handler(CommandHandler("stop", stop))
+        # 添加命令處理器
+        dispatcher.add_handler(CommandHandler("seturl", seturl))
+        dispatcher.add_handler(CommandHandler("start", start))
+        dispatcher.add_handler(CommandHandler("resume", resume))
+        dispatcher.add_handler(CommandHandler("stop", stop))
 
-    # 設置 Telegram 命令選單
-    bot = Bot(TOKEN)
-    bot.set_my_commands([
-        ("seturl", "設置圖片頁面網址（例如 /seturl <網址>）"),
-        ("start", "開始每分鐘傳送最新圖片"),
-        ("resume", "恢復傳送圖片"),
-        ("stop", "停止傳送圖片")
-    ])
-    logger.info("Telegram 命令選單已設置")
+        # 設置 Telegram 命令選單
+        bot = Bot(TOKEN)
+        bot.set_my_commands([
+            ("seturl", "設置圖片頁面網址（例如 /seturl <網址>）"),
+            ("start", "開始每分鐘傳送最新圖片"),
+            ("resume", "恢復傳送圖片"),
+            ("stop", "停止傳送圖片")
+        ])
+        logger.info("Telegram 命令選單已設置")
 
-    # 設置 Webhook
-    updater.bot.set_webhook(WEBHOOK_URL)
-    logger.info(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
+        # 設置 Webhook
+        updater.bot.set_webhook(WEBHOOK_URL)
+        logger.info(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
+    except Exception as e:
+        logger.error(f"初始化 Bot 失敗：{e}")
+        raise
 
 def run_event_loop():
     """在獨立線程中運行事件循環"""
     global loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-    logger.info("事件循環已啟動")
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        logger.info("事件循環啟動")
+        loop.run_forever()
+    except Exception as e:
+        logger.error(f"事件循環異常停止：{e}")
+    finally:
+        logger.info("事件循環結束")
+        loop.close()
 
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
@@ -208,10 +233,13 @@ def health_check():
     return Response("Bot is running", status=200)
 
 if __name__ == "__main__":
-    # 啟動事件循環線程
-    threading.Thread(target=run_event_loop, daemon=True).start()
-    # 初始化 Bot
-    initialize_bot()
-    port = int(os.getenv("PORT", 8443))
-    logger.info(f"啟動 Flask 伺服器，端口：{port}")
-    flask_app.run(host="0.0.0.0", port=port)
+    try:
+        # 啟動事件循環線程
+        threading.Thread(target=run_event_loop, daemon=True).start()
+        # 初始化 Bot
+        initialize_bot()
+        port = int(os.getenv("PORT", 8443))
+        logger.info(f"啟動 Flask 伺服器，端口：{port}")
+        flask_app.run(host="0.0.0.0", port=port)
+    except Exception as e:
+        logger.error(f"主程式異常：{e}")
