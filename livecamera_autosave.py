@@ -19,6 +19,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 DEFAULT_PAGE_URL = "https://live.fujigoko.tv/?n=26&b=0"
 DEFAULT_IMAGE_URL = "https://cam.fujigoko.tv/livecam26/cam1_9892.jpg"
+DEFAULT_LOCATION = "富士山ライブカメラ-鳴沢村活き活き広場"
 
 # 用於控制任務和儲存網址的全局變數
 running = False
@@ -33,20 +34,26 @@ flask_app = Flask(__name__)
 updater = None
 
 async def get_latest_image_url(page_url):
-    """從指定頁面爬取最新的圖片網址"""
+    """從指定頁面爬取最新的圖片網址和地點名稱"""
     try:
-        response = requests.get(page_url, timeout=10)
+        headers = {"Cache-Control": "no-cache"}
+        response = requests.get(page_url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
+        
+        # 提取圖片網址
         img_tag = soup.find("img", id="mov")
-        if img_tag and img_tag.get("src"):
-            logger.info(f"成功爬取圖片網址：{img_tag['src']}（頁面：{page_url}）")
-            return img_tag["src"]
-        logger.warning(f"未找到圖片網址（頁面：{page_url}），使用預設圖片網址")
-        return DEFAULT_IMAGE_URL
+        image_url = img_tag["src"] if img_tag and img_tag.get("src") else DEFAULT_IMAGE_URL
+        
+        # 提取地點名稱
+        location_tag = soup.find("span", class_="auto-style3")
+        location = location_tag.text.strip().lstrip("/ ").strip() if location_tag else DEFAULT_LOCATION
+        
+        logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}（頁面：{page_url}）")
+        return image_url, location
     except Exception as e:
-        logger.error(f"爬取圖片網址失敗（頁面：{page_url}）：{e}")
-        return DEFAULT_IMAGE_URL
+        logger.error(f"爬取圖片網址或地點失敗（頁面：{page_url}）：{e}")
+        return DEFAULT_IMAGE_URL, DEFAULT_LOCATION
 
 def seturl(update: Update, context: CallbackContext):
     global user_page_url
@@ -121,19 +128,20 @@ async def send_images(chat_id: int, bot):
     global user_page_url
     while running:
         try:
-            # 每次傳送前獲取最新圖片網址
-            current_url = await get_latest_image_url(user_page_url)
+            # 每次傳送前獲取最新圖片網址和地點
+            current_url, location = await get_latest_image_url(user_page_url)
             # 移除舊查詢參數，添加新時間戳
             request_url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
             logger.info(f"請求圖片網址：{request_url}")
-            response = requests.get(request_url, timeout=10)
+            headers = {"Cache-Control": "no-cache"}
+            response = requests.get(request_url, headers=headers, timeout=10)
             if response.status_code == 200:
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
-                caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} (Source: 富士五湖TV)"
+                caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: 富士五湖TV)"
                 logger.info(f"準備傳送圖片，聊天 ID：{chat_id}，caption：{caption}")
-                # 確保只 await 一次，且不對返回值再次 await
+                # 執行 send_photo，確保不對返回值誤用 await
                 message = await bot.send_photo(chat_id=chat_id, photo=response.content, caption=caption)
-                logger.info(f"圖片傳送成功，網址：{current_url}，時間：{caption}，聊天 ID：{chat_id}")
+                logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}，聊天 ID：{chat_id}")
             else:
                 logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
         except Exception as e:
