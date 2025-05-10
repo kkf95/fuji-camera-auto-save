@@ -2,7 +2,7 @@ import asyncio
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
 from bs4 import BeautifulSoup
 import os
@@ -37,6 +37,7 @@ task = None
 user_page_url = DEFAULT_PAGE_URL
 loop = None
 last_task_check = 0
+chat_id = 48732810  # 固定聊天 ID
 
 # Flask 應用
 flask_app = Flask(__name__)
@@ -99,10 +100,10 @@ def start(update: Update, context: CallbackContext):
     update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
     # 在事件循環中安全啟動異步任務
     future = asyncio.run_coroutine_threadsafe(
-        send_images(update.effective_chat.id, context.bot), loop
+        send_images(), loop
     )
     task = future
-    logger.info(f"啟動圖片傳送任務，聊天 ID：{update.effective_chat.id}")
+    logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
 
 def resume(update: Update, context: CallbackContext):
     global running, task
@@ -114,10 +115,10 @@ def resume(update: Update, context: CallbackContext):
     update.message.reply_text("Bot 已恢復，將每分鐘傳送最新圖片。")
     # 在事件循環中安全啟動異步任務
     future = asyncio.run_coroutine_threadsafe(
-        send_images(update.effective_chat.id, context.bot), loop
+        send_images(), loop
     )
     task = future
-    logger.info(f"恢復圖片傳送任務，聊天 ID：{update.effective_chat.id}")
+    logger.info(f"恢復圖片傳送任務，聊天 ID：{chat_id}")
 
 def stop(update: Update, context: CallbackContext):
     global running, task
@@ -132,7 +133,7 @@ def stop(update: Update, context: CallbackContext):
     update.message.reply_text("Bot 已停止。使用 /resume 恢復。")
     logger.info("停止圖片傳送任務")
 
-async def send_images(chat_id: int, bot):
+async def send_images():
     global user_page_url, running
     logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
     while running:
@@ -147,9 +148,15 @@ async def send_images(chat_id: int, bot):
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
                 caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: 富士五湖TV)"
                 logger.info(f"準備傳送圖片，聊天 ID：{chat_id}，caption：{caption}")
-                # 執行圖片傳送
-                message = await bot.send_photo(chat_id=chat_id, photo=response.content, caption=caption)
-                logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}，聊天 ID：{chat_id}")
+                # 使用 Telegram HTTP API 發送圖片
+                url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+                files = {"photo": response.content}
+                data = {"chat_id": chat_id, "caption": caption}
+                telegram_response = requests.post(url, data=data, files=files, timeout=10)
+                if telegram_response.status_code == 200:
+                    logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}，聊天 ID：{chat_id}")
+                else:
+                    logger.error(f"圖片傳送失敗，狀態碼：{telegram_response.status_code}，回應：{telegram_response.text}")
             else:
                 logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
         except asyncio.CancelledError:
@@ -170,7 +177,7 @@ async def send_images(chat_id: int, bot):
             logger.error(f"睡眠期間異常：{e}\n{traceback.format_exc()}")
     logger.info(f"圖片傳送循環結束，聊天 ID：{chat_id}")
 
-async def watchdog(chat_id: int, bot):
+async def watchdog():
     """看門狗任務，檢查 send_images 是否運行"""
     global running, task, last_task_check
     logger.info("看門狗任務啟動")
@@ -185,7 +192,7 @@ async def watchdog(chat_id: int, bot):
                     task = None
                 if not running:
                     running = True
-                    future = asyncio.run_coroutine_threadsafe(send_images(chat_id, bot), loop)
+                    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
                     task = future
                     logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
                 last_task_check = current_time
@@ -208,21 +215,34 @@ def initialize_bot():
         dispatcher.add_handler(CommandHandler("stop", stop))
 
         # 設置 Telegram 命令選單
-        bot = Bot(TOKEN)
-        bot.set_my_commands([
-            ("seturl", "設置圖片頁面網址（例如 /seturl <網址>）"),
-            ("start", "開始每分鐘傳送最新圖片"),
-            ("resume", "恢復傳送圖片"),
-            ("stop", "停止傳送圖片")
-        ])
-        logger.info("Telegram 命令選單已設置")
+        response = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/setMyCommands",
+            json={
+                "commands": [
+                    {"command": "seturl", "description": "設置圖片頁面網址（例如 /seturl <網址>）"},
+                    {"command": "start", "description": "開始每分鐘傳送最新圖片"},
+                    {"command": "resume", "description": "恢復傳送圖片"},
+                    {"command": "stop", "description": "停止傳送圖片"}
+                ]
+            }
+        )
+        if response.status_code == 200:
+            logger.info("Telegram 命令選單已設置")
+        else:
+            logger.error(f"設置命令選單失敗：{response.text}")
 
         # 設置 Webhook
-        bot.set_webhook(WEBHOOK_URL)
-        logger.info(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
+        response = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            json={"url": WEBHOOK_URL}
+        )
+        if response.status_code == 200:
+            logger.info(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
+        else:
+            logger.error(f"設置 Webhook 失敗：{response.text}")
 
         # 啟動看門狗任務
-        asyncio.run_coroutine_threadsafe(watchdog(48732810, bot), loop)
+        asyncio.run_coroutine_threadsafe(watchdog(), loop)
         logger.info("看門狗任務已啟動")
     except Exception as e:
         logger.error(f"初始化 Bot 失敗：{e}\n{traceback.format_exc()}")
