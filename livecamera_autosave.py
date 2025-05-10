@@ -1,26 +1,328 @@
-# 在檔案頂部添加
-session = requests.Session()
+import asyncio
+import requests
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+from bs4 import BeautifulSoup
+import os
+from flask import Flask, request, Response
+import threading
+import logging
+import sys
+import traceback
+import time
+import psutil
+
+# 設置日誌
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log', mode='a')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# 從環境變數獲取 Telegram Bot Token 和 Webhook URL
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+DEFAULT_PAGE_URL = "https://live.fujigoko.tv/?n=26&b=0"
+DEFAULT_IMAGE_URL = "https://cam.fujigoko.tv/livecam26/cam1_9892.jpg"
+DEFAULT_LOCATION = "鳴沢村活き活き広場"
+
+# 用於控制任務和儲存網址的全局變數
+running = False
+task = None
+user_page_url = DEFAULT_PAGE_URL
+loop = None
+last_task_check = 0
+chat_id = 48732810  # 固定聊天 ID
+session = requests.Session()  # HTTP 會話複用
+
+# Flask 應用
+flask_app = Flask(__name__)
+
+# Telegram Updater
+updater = None
 
 async def get_latest_image_url(page_url):
     """從指定頁面爬取圖片網址和地點名稱"""
+    logger.info(f"開始爬取圖片網址，頁面：{page_url}")
     try:
-        response = session.get(page_url, timeout=10)
+        response = session.get(page_url, timeout=5)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         img_tag = soup.find("img", id="mov")
         image_url = img_tag["src"] if img_tag and img_tag.get("src") else DEFAULT_IMAGE_URL
         location_tag = soup.find("span", class_="auto-style3")
         location = location_tag.text.strip().replace("/ ", "") if location_tag else DEFAULT_LOCATION
-        logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}（頁面：{page_url}）")
+        logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}")
         return image_url, location
     except Exception as e:
-        logger.error(f"爬取圖片網址或地點失敗（頁面：{page_url}）：{e}\n{traceback.format_exc()}")
+        logger.error(f"爬取圖片網址或地點失敗：{e}\n{traceback.format_exc()}")
         return DEFAULT_IMAGE_URL, DEFAULT_LOCATION
 
+def seturl(update: Update, context: CallbackContext):
+    global user_page_url
+    if not context.args:
+        update.message.reply_text("請提供網址！用法：/seturl <網址>")
+        return
+
+    new_url = context.args[0]
+    if not new_url.startswith("http"):
+        update.message.reply_text("請提供有效的網址（以 http 或 https 開頭）！")
+        return
+
+    try:
+        response = session.get(new_url, timeout=5)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        img_tag = soup.find("img", id="mov")
+        if not img_tag or not img_tag.get("src"):
+            update.message.reply_text("該網址無效，無法找到圖片（<img id='mov'>）！")
+            return
+    except Exception as e:
+        update.message.reply_text(f"錯誤：無法訪問網址 ({str(e)})")
+        return
+
+    user_page_url = new_url
+    update.message.reply_text(f"網址已設定為：{new_url}\n使用 /start 開始傳送圖片。")
+    logger.info(f"網址設定為：{new_url}，聊天 ID：{update.effective_chat.id}")
+
+def start(update: Update, context: CallbackContext):
+    global running, task
+    if running:
+        update.message.reply_text("Bot 已經在運行！")
+        return
+
+    running = True
+    update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
+    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
+    task = future
+    logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
+    global last_task_check
+    last_task_check = time.time()
+
+def resume(update: Update, context: CallbackContext):
+    global running, task
+    if running:
+        update.message.reply_text("Bot 已經在運行！")
+        return
+
+    running = True
+    update.message.reply_text("Bot 已恢復，將每分鐘傳送最新圖片。")
+    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
+    task = future
+    logger.info(f"恢復圖片傳送任務，聊天 ID：{chat_id}")
+    global last_task_check
+    last_task_check = time.time()
+
+def stop(update: Update, context: CallbackContext):
+    global running, task
+    if not running:
+        update.message.reply_text("Bot 已經停止！")
+        return
+
+    running = False
+    if task:
+        task.cancel()
+        logger.info("任務已取消")
+    update.message.reply_text("Bot 已停止。使用 /resume 恢復。")
+    logger.info("停止圖片傳送任務")
+
 async def send_images():
-    # ... 其他程式碼不變 ...
-    # 修改圖片下載部分
-    download_start = time.time()
-    response = session.get(request_url, timeout=10)
-    download_duration = time.time() - download_start
-    # ... 其他程式碼不變 ...
+    global user_page_url, running, last_task_check
+    logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
+    while running:
+        try:
+            logger.info("進入圖片傳送迴圈")
+            last_task_check = time.time()
+            current_url, location = await get_latest_image_url(user_page_url)
+            request_url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
+            logger.info(f"請求圖片網址：{request_url}")
+            response = session.get(request_url, timeout=5)
+            if response.status_code == 200:
+                jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
+                caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: 富士五湖TV)"
+                logger.info(f"準備傳送圖片，caption：{caption}")
+                url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+                files = {"photo": response.content}
+                data = {"chat_id": chat_id, "caption": caption}
+                telegram_response = session.post(url, data=data, files=files, timeout=5)
+                if telegram_response.status_code == 200:
+                    logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}")
+                else:
+                    logger.error(f"圖片傳送失敗，狀態碼：{telegram_response.status_code}，回應：{telegram_response.text}")
+            else:
+                logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
+            # 記錄內存使用
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            logger.info(f"內存使用：RSS={mem_info.rss / 1024 / 1024:.2f}MB, VMS={mem_info.vms / 1024 / 1024:.2f}MB")
+            logger.info("即將進入 60 秒睡眠")
+            await asyncio.sleep(60)
+            logger.info("睡眠結束，繼續迴圈")
+        except asyncio.CancelledError:
+            logger.info(f"圖片傳送任務被取消，聊天 ID：{chat_id}")
+            running = False
+            break
+        except Exception as e:
+            logger.error(f"圖片傳送流程異常：{e}\n{traceback.format_exc()}")
+            await asyncio.sleep(10)  # 異常後短暫等待
+        except BaseException as e:
+            logger.error(f"圖片傳送流程系統級異常：{e}\n{traceback.format_exc()}")
+            await asyncio.sleep(10)
+
+async def watchdog():
+    global running, task, last_task_check
+    logger.info("看門狗任務啟動")
+    while True:
+        try:
+            current_time = time.time()
+            logger.debug(f"看門狗檢查：running={running}, last_task_check={last_task_check}, current_time={current_time}")
+            if running and (current_time - last_task_check > 120):  # 縮短到 2 分鐘
+                logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}")
+                if task and task.done():
+                    logger.error("任務已終止，重新啟動")
+                    running = False
+                    task = None
+                if not running:
+                    running = True
+                    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
+                    task = future
+                    last_task_check = time.time()
+                    logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
+            await asyncio.sleep(15)  # 檢查頻率提高到每 15 秒
+        except Exception as e:
+            logger.error(f"看門狗異常：{e}\n{traceback.format_exc()}")
+            await asyncio.sleep(15)
+
+async def keep_alive():
+    logger.info("Keep-alive 任務啟動")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            data = {
+                "chat_id": chat_id,
+                "text": f"Bot is alive at {datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m-%d JST %H:%M')}"
+            }
+            response = session.post(url, json=data, timeout=5)
+            if response.status_code == 200:
+                logger.info("Keep-alive 訊息發送成功")
+            else:
+                logger.error(f"Keep-alive 訊息發送失敗，狀態碼：{response.status_code}，回應：{response.text}")
+            await asyncio.sleep(300)
+        except Exception as e:
+            logger.error(f"Keep-alive 異常：{e}\n{traceback.format_exc()}")
+            await asyncio.sleep(300)
+
+def initialize_bot():
+    global updater
+    try:
+        updater = Updater(TOKEN, use_context=True)
+        dispatcher = updater.dispatcher
+        dispatcher.add_handler(CommandHandler("seturl", seturl))
+        dispatcher.add_handler(CommandHandler("start", start))
+        dispatcher.add_handler(CommandHandler("resume", resume))
+        dispatcher.add_handler(CommandHandler("stop", stop))
+        response = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/setMyCommands",
+            json={
+                "commands": [
+                    {"command": "seturl", "description": "設置圖片頁面網址（例如 /seturl <網址>）"},
+                    {"command": "start", "description": "開始每分鐘傳送最新圖片"},
+                    {"command": "resume", "description": "恢復傳送圖片"},
+                    {"command": "stop", "description": "停止傳送圖片"}
+                ]
+            }
+        )
+        if response.status_code == 200:
+            logger.info("Telegram 命令選單已設置")
+        else:
+            logger.error(f"設置命令選單失敗：{response.text}")
+        response = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            json={"url": WEBHOOK_URL}
+        )
+        if response.status_code == 200:
+            logger.info(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
+        else:
+            logger.error(f"設置 Webhook 失敗：{response.text}")
+        asyncio.run_coroutine_threadsafe(watchdog(), loop)
+        asyncio.run_coroutine_threadsafe(keep_alive(), loop)
+        logger.info("看門狗和 Keep-alive 任務已啟動")
+    except Exception as e:
+        logger.error(f"初始化 Bot 失敗：{e}\n{traceback.format_exc()}")
+        raise
+
+def run_event_loop():
+    global loop
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        logger.info("事件循環啟動")
+        loop.run_forever()
+    except KeyboardInterrupt:
+        logger.info("收到鍵盤中斷，關閉事件循環")
+    except Exception as e:
+        logger.error(f"事件循環異常停止：{e}\n{traceback.format_exc()}")
+    except BaseException as e:
+        logger.error(f"事件循環系統級異常停止：{e}\n{traceback.format_exc()}")
+    finally:
+        logger.info("關閉事件循環")
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+@flask_app.route("/webhook", methods=["POST"])
+def webhook():
+    global updater
+    logger.info("收到 Webhook 請求")
+    if updater is None:
+        logger.warning("Updater 未初始化，正在初始化")
+        initialize_bot()
+    try:
+        update = Update.de_json(request.get_json(), updater.bot)
+        if update:
+            updater.dispatcher.process_update(update)
+            logger.info("Webhook 請求處理成功")
+        else:
+            logger.warning("無效的 Webhook 請求")
+        global last_task_check
+        last_task_check = time.time()
+        return Response(status=200)
+    except Exception as e:
+        logger.error(f"處理 Webhook 請求失敗：{e}\n{traceback.format_exc()}")
+        return Response(status=500)
+
+@flask_app.route("/", methods=["GET"])
+def health_check():
+    logger.info("收到健康檢查請求")
+    global running, task
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    status = {
+        "running": running,
+        "task_active": task is not None and not task.done(),
+        "last_task_check": last_task_check,
+        "timestamp": time.time(),
+        "memory_rss_mb": mem_info.rss / 1024 / 1024,
+        "memory_vms_mb": mem_info.vms / 1024 / 1024
+    }
+    return Response(f"Bot is running: {status}", status=200)
+
+if __name__ == "__main__":
+    try:
+        threading.Thread(target=run_event_loop, daemon=True).start()
+        initialize_bot()
+        port = int(os.getenv("PORT", 8443))
+        logger.info(f"啟動 Flask 伺服器，端口：{port}")
+        flask_app.run(host="0.0.0.0", port=port)
+    except Exception as e:
+        logger.error(f"主程式異常：{e}\n{traceback.format_exc()}")
+    except BaseException as e:
+        logger.error(f"主程式系統級異常：{e}\n{traceback.format_exc()}")
