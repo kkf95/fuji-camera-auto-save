@@ -2,3 +2,4 @@ python-telegram-bot==13.7
 requests==2.31.0
 flask==2.3.3
 beautifulsoup4==4.12.3
+psutil==6.0.0
