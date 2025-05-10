@@ -37,7 +37,7 @@ task = None
 user_page_url = DEFAULT_PAGE_URL
 loop = None
 last_task_check = 0
-chat_id = 48732810  # 固定聊天 ID
+chat_id = 48732810  # 固定聊天 ID，可改為動態
 
 # Flask 應用
 flask_app = Flask(__name__)
@@ -104,6 +104,8 @@ def start(update: Update, context: CallbackContext):
     )
     task = future
     logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
+    global last_task_check
+    last_task_check = time.time()
 
 def resume(update: Update, context: CallbackContext):
     global running, task
@@ -119,6 +121,8 @@ def resume(update: Update, context: CallbackContext):
     )
     task = future
     logger.info(f"恢復圖片傳送任務，聊天 ID：{chat_id}")
+    global last_task_check
+    last_task_check = time.time()
 
 def stop(update: Update, context: CallbackContext):
     global running, task
@@ -134,10 +138,12 @@ def stop(update: Update, context: CallbackContext):
     logger.info("停止圖片傳送任務")
 
 async def send_images():
-    global user_page_url, running
+    global user_page_url, running, last_task_check
     logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
     while running:
         try:
+            # 更新任務檢查時間
+            last_task_check = time.time()
             # 獲取圖片網址和地點
             current_url, location = await get_latest_image_url(user_page_url)
             # 移除舊查詢參數，添加新時間戳
@@ -184,8 +190,8 @@ async def watchdog():
     while True:
         try:
             current_time = time.time()
-            if running and (current_time - last_task_check > 120):
-                logger.warning("檢測到任務可能停止，嘗試重啟")
+            if running and (current_time - last_task_check > 300):  # 放寬到 300 秒
+                logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}")
                 if task and task.done():
                     logger.error("任務已終止，重新啟動")
                     running = False
@@ -194,12 +200,32 @@ async def watchdog():
                     running = True
                     future = asyncio.run_coroutine_threadsafe(send_images(), loop)
                     task = future
+                    last_task_check = time.time()
                     logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
-                last_task_check = current_time
             await asyncio.sleep(30)
         except Exception as e:
             logger.error(f"看門狗異常：{e}\n{traceback.format_exc()}")
             await asyncio.sleep(30)
+
+async def keep_alive():
+    """定時發送健康檢查訊息，防止 Render 閒置"""
+    logger.info("Keep-alive 任務啟動")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            data = {
+                "chat_id": chat_id,
+                "text": f"Bot is alive at {datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m-%d JST %H:%M')}"
+            }
+            response = requests.post(url, json=data, timeout=10)
+            if response.status_code == 200:
+                logger.info("Keep-alive 訊息發送成功")
+            else:
+                logger.error(f"Keep-alive 訊息發送失敗，狀態碼：{response.status_code}，回應：{response.text}")
+            await asyncio.sleep(600)  # 每 10 分鐘
+        except Exception as e:
+            logger.error(f"Keep-alive 異常：{e}\n{traceback.format_exc()}")
+            await asyncio.sleep(600)
 
 def initialize_bot():
     global updater
@@ -241,9 +267,10 @@ def initialize_bot():
         else:
             logger.error(f"設置 Webhook 失敗：{response.text}")
 
-        # 啟動看門狗任務
+        # 啟動看門狗和 keep-alive 任務
         asyncio.run_coroutine_threadsafe(watchdog(), loop)
-        logger.info("看門狗任務已啟動")
+        asyncio.run_coroutine_threadsafe(keep_alive(), loop)
+        logger.info("看門狗和 Keep-alive 任務已啟動")
     except Exception as e:
         logger.error(f"初始化 Bot 失敗：{e}\n{traceback.format_exc()}")
         raise
