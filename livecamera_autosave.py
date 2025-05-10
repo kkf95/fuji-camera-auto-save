@@ -12,6 +12,7 @@ import logging
 import sys
 import traceback
 import time
+import psutil
 
 # 設置日誌
 logging.basicConfig(
@@ -37,7 +38,7 @@ task = None
 user_page_url = DEFAULT_PAGE_URL
 loop = None
 last_task_check = 0
-chat_id = 48732810  # 固定聊天 ID，可改為動態
+chat_id = 48732810  # 固定聊天 ID
 
 # Flask 應用
 flask_app = Flask(__name__)
@@ -51,10 +52,8 @@ async def get_latest_image_url(page_url):
         response = requests.get(page_url, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        # 提取圖片網址
         img_tag = soup.find("img", id="mov")
         image_url = img_tag["src"] if img_tag and img_tag.get("src") else DEFAULT_IMAGE_URL
-        # 提取地點名稱
         location_tag = soup.find("span", class_="auto-style3")
         location = location_tag.text.strip().replace("/ ", "") if location_tag else DEFAULT_LOCATION
         logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}（頁面：{page_url}）")
@@ -98,10 +97,7 @@ def start(update: Update, context: CallbackContext):
 
     running = True
     update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
-    # 在事件循環中安全啟動異步任務
-    future = asyncio.run_coroutine_threadsafe(
-        send_images(), loop
-    )
+    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
     task = future
     logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
@@ -115,10 +111,7 @@ def resume(update: Update, context: CallbackContext):
 
     running = True
     update.message.reply_text("Bot 已恢復，將每分鐘傳送最新圖片。")
-    # 在事件循環中安全啟動異步任務
-    future = asyncio.run_coroutine_threadsafe(
-        send_images(), loop
-    )
+    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
     task = future
     logger.info(f"恢復圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
@@ -142,11 +135,8 @@ async def send_images():
     logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
     while running:
         try:
-            # 更新任務檢查時間
             last_task_check = time.time()
-            # 獲取圖片網址和地點
             current_url, location = await get_latest_image_url(user_page_url)
-            # 移除舊查詢參數，添加新時間戳
             request_url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
             logger.info(f"請求圖片網址：{request_url}")
             response = requests.get(request_url, timeout=10)
@@ -154,7 +144,6 @@ async def send_images():
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
                 caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: 富士五湖TV)"
                 logger.info(f"準備傳送圖片，聊天 ID：{chat_id}，caption：{caption}")
-                # 使用 Telegram HTTP API 發送圖片
                 url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
                 files = {"photo": response.content}
                 data = {"chat_id": chat_id, "caption": caption}
@@ -174,6 +163,10 @@ async def send_images():
         except BaseException as e:
             logger.error(f"圖片傳送流程系統級異常：{e}\n{traceback.format_exc()}")
         try:
+            # 記錄內存使用情況
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            logger.info(f"內存使用：RSS={mem_info.rss / 1024 / 1024:.2f}MB, VMS={mem_info.vms / 1024 / 1024:.2f}MB")
             await asyncio.sleep(60)
         except asyncio.CancelledError:
             logger.info(f"圖片傳送任務被取消（睡眠期間），聊天 ID：{chat_id}")
@@ -184,13 +177,13 @@ async def send_images():
     logger.info(f"圖片傳送循環結束，聊天 ID：{chat_id}")
 
 async def watchdog():
-    """看門狗任務，檢查 send_images 是否運行"""
     global running, task, last_task_check
     logger.info("看門狗任務啟動")
     while True:
         try:
             current_time = time.time()
-            if running and (current_time - last_task_check > 300):  # 放寬到 300 秒
+            logger.debug(f"看門狗檢查：running={running}, last_task_check={last_task_check}, current_time={current_time}")
+            if running and (current_time - last_task_check > 300):
                 logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}")
                 if task and task.done():
                     logger.error("任務已終止，重新啟動")
@@ -208,7 +201,6 @@ async def watchdog():
             await asyncio.sleep(30)
 
 async def keep_alive():
-    """定時發送健康檢查訊息，防止 Render 閒置"""
     logger.info("Keep-alive 任務啟動")
     while True:
         try:
@@ -222,25 +214,20 @@ async def keep_alive():
                 logger.info("Keep-alive 訊息發送成功")
             else:
                 logger.error(f"Keep-alive 訊息發送失敗，狀態碼：{response.status_code}，回應：{response.text}")
-            await asyncio.sleep(600)  # 每 10 分鐘
+            await asyncio.sleep(300)  # 改為每 5 分鐘
         except Exception as e:
             logger.error(f"Keep-alive 異常：{e}\n{traceback.format_exc()}")
-            await asyncio.sleep(600)
+            await asyncio.sleep(300)
 
 def initialize_bot():
     global updater
     try:
-        # 初始化 Updater
         updater = Updater(TOKEN, use_context=True)
         dispatcher = updater.dispatcher
-
-        # 添加命令處理器
         dispatcher.add_handler(CommandHandler("seturl", seturl))
         dispatcher.add_handler(CommandHandler("start", start))
         dispatcher.add_handler(CommandHandler("resume", resume))
         dispatcher.add_handler(CommandHandler("stop", stop))
-
-        # 設置 Telegram 命令選單
         response = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/setMyCommands",
             json={
@@ -256,8 +243,6 @@ def initialize_bot():
             logger.info("Telegram 命令選單已設置")
         else:
             logger.error(f"設置命令選單失敗：{response.text}")
-
-        # 設置 Webhook
         response = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/setWebhook",
             json={"url": WEBHOOK_URL}
@@ -266,8 +251,6 @@ def initialize_bot():
             logger.info(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
         else:
             logger.error(f"設置 Webhook 失敗：{response.text}")
-
-        # 啟動看門狗和 keep-alive 任務
         asyncio.run_coroutine_threadsafe(watchdog(), loop)
         asyncio.run_coroutine_threadsafe(keep_alive(), loop)
         logger.info("看門狗和 Keep-alive 任務已啟動")
@@ -276,19 +259,24 @@ def initialize_bot():
         raise
 
 def run_event_loop():
-    """在獨立線程中運行事件循環"""
     global loop
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         logger.info("事件循環啟動")
         loop.run_forever()
+    except KeyboardInterrupt:
+        logger.info("收到鍵盤中斷，關閉事件循環")
     except Exception as e:
         logger.error(f"事件循環異常停止：{e}\n{traceback.format_exc()}")
     except BaseException as e:
         logger.error(f"事件循環系統級異常停止：{e}\n{traceback.format_exc()}")
     finally:
-        logger.info("事件循環結束")
+        logger.info("關閉事件循環")
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
 
 @flask_app.route("/webhook", methods=["POST"])
@@ -306,7 +294,7 @@ def webhook():
         else:
             logger.warning("無效的 Webhook 請求")
         global last_task_check
-        last_task_check = time.time()  # 更新任務檢查時間
+        last_task_check = time.time()
         return Response(status=200)
     except Exception as e:
         logger.error(f"處理 Webhook 請求失敗：{e}\n{traceback.format_exc()}")
@@ -314,22 +302,23 @@ def webhook():
 
 @flask_app.route("/", methods=["GET"])
 def health_check():
-    """健康檢查端點"""
     logger.info("收到健康檢查請求")
     global running, task
+    process = psutil.Process()
+    mem_info = process.memory_info()
     status = {
         "running": running,
         "task_active": task is not None and not task.done(),
         "last_task_check": last_task_check,
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        "memory_rss_mb": mem_info.rss / 1024 / 1024,
+        "memory_vms_mb": mem_info.vms / 1024 / 1024
     }
     return Response(f"Bot is running: {status}", status=200)
 
 if __name__ == "__main__":
     try:
-        # 啟動事件循環線程
         threading.Thread(target=run_event_loop, daemon=True).start()
-        # 初始化 Bot
         initialize_bot()
         port = int(os.getenv("PORT", 8443))
         logger.info(f"啟動 Flask 伺服器，端口：{port}")
