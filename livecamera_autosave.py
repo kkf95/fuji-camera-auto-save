@@ -40,6 +40,7 @@ loop = None
 last_task_check = 0
 chat_id = 48732810  # 固定聊天 ID
 session = requests.Session()  # HTTP 會話複用
+last_image_url = None  # 記錄上一次圖片網址
 
 # Flask 應用
 flask_app = Flask(__name__)
@@ -59,10 +60,13 @@ async def get_latest_image_url(page_url):
         location_tag = soup.find("span", class_="auto-style3")
         location = location_tag.text.strip().replace("/ ", "") if location_tag else DEFAULT_LOCATION
         logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}")
+        response.close()  # 釋放資源
         return image_url, location
     except Exception as e:
         logger.error(f"爬取圖片網址或地點失敗：{e}\n{traceback.format_exc()}")
         return DEFAULT_IMAGE_URL, DEFAULT_LOCATION
+    finally:
+        response.close() if 'response' in locals() else None
 
 def seturl(update: Update, context: CallbackContext):
     global user_page_url
@@ -86,6 +90,8 @@ def seturl(update: Update, context: CallbackContext):
     except Exception as e:
         update.message.reply_text(f"錯誤：無法訪問網址 ({str(e)})")
         return
+    finally:
+        response.close() if 'response' in locals() else None
 
     user_page_url = new_url
     update.message.reply_text(f"網址已設定為：{new_url}\n使用 /start 開始傳送圖片。")
@@ -99,8 +105,7 @@ def start(update: Update, context: CallbackContext):
 
     running = True
     update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
-    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
-    task = future
+    task = asyncio.ensure_future(send_images(), loop=loop)
     logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
     last_task_check = time.time()
@@ -112,9 +117,8 @@ def resume(update: Update, context: CallbackContext):
         return
 
     running = True
-    update.message.reply_text("Bot 已恢復，將每分鐘傳送最新圖片。")
-    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
-    task = future
+    update.message.reply_text("Bot 已恢復，將每分鐘傳送圖片。")
+    task = asyncio.ensure_future(send_images(), loop=loop)
     logger.info(f"恢復圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
     last_task_check = time.time()
@@ -133,13 +137,18 @@ def stop(update: Update, context: CallbackContext):
     logger.info("停止圖片傳送任務")
 
 async def send_images():
-    global user_page_url, running, last_task_check
+    global user_page_url, running, last_task_check, last_image_url
     logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
     while running:
         try:
             logger.info("進入圖片傳送迴圈")
             last_task_check = time.time()
             current_url, location = await get_latest_image_url(user_page_url)
+            if current_url != last_image_url:
+                last_image_url = current_url
+                logger.info(f"圖片網址已更新：{current_url}")
+            else:
+                logger.info(f"圖片網址未變：{current_url}")
             request_url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
             logger.info(f"請求圖片網址：{request_url}")
             response = session.get(request_url, timeout=5)
@@ -155,8 +164,11 @@ async def send_images():
                     logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}")
                 else:
                     logger.error(f"圖片傳送失敗，狀態碼：{telegram_response.status_code}，回應：{telegram_response.text}")
+                response.close()
+                telegram_response.close()
             else:
                 logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
+                response.close()
             # 記錄內存使用
             process = psutil.Process()
             mem_info = process.memory_info()
@@ -170,10 +182,16 @@ async def send_images():
             break
         except Exception as e:
             logger.error(f"圖片傳送流程異常：{e}\n{traceback.format_exc()}")
-            await asyncio.sleep(10)  # 異常後短暫等待
+            await asyncio.sleep(10)
         except BaseException as e:
             logger.error(f"圖片傳送流程系統級異常：{e}\n{traceback.format_exc()}")
             await asyncio.sleep(10)
+        finally:
+            logger.info("圖片傳送迴圈結束，檢查是否需要重啟")
+            if running and (not task or task.done()):
+                logger.warning("圖片傳送任務終止，自動重啟")
+                task = asyncio.ensure_future(send_images(), loop=loop)
+                last_task_check = time.time()
 
 async def watchdog():
     global running, task, last_task_check
@@ -181,23 +199,17 @@ async def watchdog():
     while True:
         try:
             current_time = time.time()
-            logger.debug(f"看門狗檢查：running={running}, last_task_check={last_task_check}, current_time={current_time}")
-            if running and (current_time - last_task_check > 120):  # 縮短到 2 分鐘
+            logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s")
+            if running and (not task or task.done() or (current_time - last_task_check > 60)):
                 logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}")
-                if task and task.done():
-                    logger.error("任務已終止，重新啟動")
-                    running = False
-                    task = None
-                if not running:
-                    running = True
-                    future = asyncio.run_coroutine_threadsafe(send_images(), loop)
-                    task = future
-                    last_task_check = time.time()
-                    logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
-            await asyncio.sleep(15)  # 檢查頻率提高到每 15 秒
+                running = True
+                task = asyncio.ensure_future(send_images(), loop=loop)
+                last_task_check = time.time()
+                logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
+            await asyncio.sleep(10)  # 每 10 秒檢查
         except Exception as e:
             logger.error(f"看門狗異常：{e}\n{traceback.format_exc()}")
-            await asyncio.sleep(15)
+            await asyncio.sleep(10)
 
 async def keep_alive():
     logger.info("Keep-alive 任務啟動")
@@ -213,6 +225,7 @@ async def keep_alive():
                 logger.info("Keep-alive 訊息發送成功")
             else:
                 logger.error(f"Keep-alive 訊息發送失敗，狀態碼：{response.status_code}，回應：{response.text}")
+            response.close()
             await asyncio.sleep(300)
         except Exception as e:
             logger.error(f"Keep-alive 異常：{e}\n{traceback.format_exc()}")
@@ -242,6 +255,7 @@ def initialize_bot():
             logger.info("Telegram 命令選單已設置")
         else:
             logger.error(f"設置命令選單失敗：{response.text}")
+        response.close()
         response = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/setWebhook",
             json={"url": WEBHOOK_URL}
@@ -250,12 +264,16 @@ def initialize_bot():
             logger.info(f"Bot 正在運行，Webhook 已設定為 {WEBHOOK_URL}")
         else:
             logger.error(f"設置 Webhook 失敗：{response.text}")
+        response.close()
         asyncio.run_coroutine_threadsafe(watchdog(), loop)
         asyncio.run_coroutine_threadsafe(keep_alive(), loop)
         logger.info("看門狗和 Keep-alive 任務已啟動")
     except Exception as e:
         logger.error(f"初始化 Bot 失敗：{e}\n{traceback.format_exc()}")
         raise
+    finally:
+        for resp in [r for r in locals().values() if isinstance(r, requests.Response)]:
+            resp.close()
 
 def run_event_loop():
     global loop
@@ -280,7 +298,7 @@ def run_event_loop():
 
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    global updater
+    global updater, last_task_check
     logger.info("收到 Webhook 請求")
     if updater is None:
         logger.warning("Updater 未初始化，正在初始化")
@@ -290,16 +308,15 @@ def webhook():
         if update:
             updater.dispatcher.process_update(update)
             logger.info("Webhook 請求處理成功")
+            last_task_check = time.time()  # 更新以避免看門狗誤判
         else:
             logger.warning("無效的 Webhook 請求")
-        global last_task_check
-        last_task_check = time.time()
         return Response(status=200)
     except Exception as e:
         logger.error(f"處理 Webhook 請求失敗：{e}\n{traceback.format_exc()}")
         return Response(status=500)
 
-@flask_app.route("/", methods=["GET"])
+@flask_app.route("/", methods=["GET", "HEAD"])
 def health_check():
     logger.info("收到健康檢查請求")
     global running, task
