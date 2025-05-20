@@ -105,7 +105,7 @@ def start(update: Update, context: CallbackContext):
 
     running = True
     update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
-    task = asyncio.ensure_future(send_images(), loop=loop)
+    task = asyncio.create_task(send_images())
     logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
     last_task_check = time.time()
@@ -118,7 +118,7 @@ def resume(update: Update, context: CallbackContext):
 
     running = True
     update.message.reply_text("Bot 已恢復，將每分鐘傳送圖片。")
-    task = asyncio.ensure_future(send_images(), loop=loop)
+    task = asyncio.create_task(send_images())
     logger.info(f"恢復圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
     last_task_check = time.time()
@@ -137,7 +137,7 @@ def stop(update: Update, context: CallbackContext):
     logger.info("停止圖片傳送任務")
 
 async def send_images():
-    global user_page_url, running, last_task_check, last_image_url
+    global user_page_url, running, last_task_check, last_image_url, task
     logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
     while running:
         try:
@@ -188,10 +188,11 @@ async def send_images():
             await asyncio.sleep(10)
         finally:
             logger.info("圖片傳送迴圈結束，檢查是否需要重啟")
-            if running and (not task or task.done()):
+            if running and (task is None or task.done()):
                 logger.warning("圖片傳送任務終止，自動重啟")
-                task = asyncio.ensure_future(send_images(), loop=loop)
+                task = asyncio.create_task(send_images())
                 last_task_check = time.time()
+                logger.info(f"自動重啟圖片傳送任務，聊天 ID：{chat_id}")
 
 async def watchdog():
     global running, task, last_task_check
@@ -199,11 +200,13 @@ async def watchdog():
     while True:
         try:
             current_time = time.time()
-            logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s")
-            if running and (not task or task.done() or (current_time - last_task_check > 60)):
-                logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}")
+            task_status = task is not None and not task.done()
+            task_exception = task.exception() if task and task.done() else None
+            logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s, task_exception={task_exception}")
+            if running and (not task_status or (current_time - last_task_check > 30)):
+                logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}, task_exception={task_exception}")
                 running = True
-                task = asyncio.ensure_future(send_images(), loop=loop)
+                task = asyncio.create_task(send_images())
                 last_task_check = time.time()
                 logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
             await asyncio.sleep(10)  # 每 10 秒檢查
@@ -232,7 +235,7 @@ async def keep_alive():
             await asyncio.sleep(300)
 
 def initialize_bot():
-    global updater
+    global updater, running, task
     try:
         updater = Updater(TOKEN, use_context=True)
         dispatcher = updater.dispatcher
@@ -268,6 +271,12 @@ def initialize_bot():
         asyncio.run_coroutine_threadsafe(watchdog(), loop)
         asyncio.run_coroutine_threadsafe(keep_alive(), loop)
         logger.info("看門狗和 Keep-alive 任務已啟動")
+        # 自動啟動圖片傳送任務（若 running=True）
+        if running and (task is None or task.done()):
+            running = True
+            task = asyncio.create_task(send_images())
+            last_task_check = time.time()
+            logger.info(f"初始化時自動啟動圖片傳送任務，聊天 ID：{chat_id}")
     except Exception as e:
         logger.error(f"初始化 Bot 失敗：{e}\n{traceback.format_exc()}")
         raise
