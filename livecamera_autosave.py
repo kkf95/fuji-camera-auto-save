@@ -36,12 +36,12 @@ DEFAULT_LOCATION = "鳴沢村活き活き広場"
 running = False
 task = None
 user_page_url = DEFAULT_PAGE_URL
-loop = asyncio.get_event_loop()
+loop = None  # 將在 run_event_loop 中初始化
 last_task_check = 0
 chat_id = 48732810  # 固定聊天 ID
 session = requests.Session()  # HTTP 會話複用
 last_image_url = None  # 記錄上一次圖片網址
-run_event = asyncio.Event()  # 控制 send_images 迴圈
+run_event = None  # 將在 initialize_bot 中初始化
 
 # 持久化運行狀態檔案
 RUNNING_STATE_FILE = "running.txt"
@@ -60,19 +60,28 @@ def save_running_state(state):
         logger.info(f"儲存 running 狀態：{state} 到 {RUNNING_STATE_FILE}")
     except Exception as e:
         logger.error(f"儲存 running 狀態失敗：{e}")
+        # 通知用戶
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            data = {"chat_id": chat_id, "text": f"錯誤：無法儲存運行狀態 ({e})"}
+            session.post(url, json=data, timeout=5).close()
+        except Exception as notify_e:
+            logger.error(f"通知用戶失敗：{notify_e}")
 
 def load_running_state():
     """從檔案載入 running 狀態"""
     try:
-        if os.path.exists(RUNNING_STATE_FILE):
-            with open(RUNNING_STATE_FILE, "r") as f:
-                state = f.read().strip()
-                logger.info(f"從 {RUNNING_STATE_FILE} 載入 running 狀態：{state}")
-                return state.lower() == "true"
-        logger.warning(f"{RUNNING_STATE_FILE} 不存在，預設 running=False")
-        return False
+        if not os.path.exists(RUNNING_STATE_FILE):
+            logger.warning(f"{RUNNING_STATE_FILE} 不存在，創建並設置 running=False")
+            save_running_state(False)
+            return False
+        with open(RUNNING_STATE_FILE, "r") as f:
+            state = f.read().strip()
+            logger.info(f"從 {RUNNING_STATE_FILE} 載入 running 狀態：{state}")
+            return state.lower() == "true"
     except Exception as e:
         logger.error(f"載入 running 狀態失敗：{e}")
+        save_running_state(False)
         return False
 
 async def get_latest_image_url(page_url):
@@ -87,7 +96,6 @@ async def get_latest_image_url(page_url):
         location_tag = soup.find("span", class_="auto-style3")
         location = location_tag.text.strip().replace("/ ", "") if location_tag else DEFAULT_LOCATION
         logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}")
-        response.close()
         return image_url, location
     except Exception as e:
         logger.error(f"爬取圖片網址或地點失敗：{e}\n{traceback.format_exc()}")
@@ -132,12 +140,14 @@ def start(update: Update, context: CallbackContext):
         update.message.reply_text("Bot 已經在運行！")
         return
 
+    logger.info(f"收到 /start 指令，聊天 ID：{chat_id}")
     running = True
-    run_event.set()  # 啟動 send_images 迴圈
+    run_event.set()
     save_running_state(running)
     update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
     if task is None or task.done():
-        task = asyncio.create_task(send_images())
+        # 在事件循環中創建任務
+        asyncio.run_coroutine_threadsafe(start_send_images(), loop)
     logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
     last_task_check = time.time()
@@ -148,12 +158,13 @@ def resume(update: Update, context: CallbackContext):
         update.message.reply_text("Bot 已經在運行！")
         return
 
+    logger.info(f"收到 /resume 指令，聊天 ID：{chat_id}")
     running = True
     run_event.set()
     save_running_state(running)
     update.message.reply_text("Bot 已恢復，將每分鐘傳送圖片。")
     if task is None or task.done():
-        task = asyncio.create_task(send_images())
+        asyncio.run_coroutine_threadsafe(start_send_images(), loop)
     logger.info(f"恢復圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
     last_task_check = time.time()
@@ -164,8 +175,9 @@ def stop(update: Update, context: CallbackContext):
         update.message.reply_text("Bot 已經停止！")
         return
 
+    logger.info(f"收到 /stop 指令，聊天 ID：{chat_id}")
     running = False
-    run_event.clear()  # 暫停 send_images 迴圈
+    run_event.clear()
     save_running_state(running)
     if task and not task.done():
         task.cancel()
@@ -173,12 +185,18 @@ def stop(update: Update, context: CallbackContext):
     update.message.reply_text("Bot 已停止。使用 /resume 恢復。")
     logger.info("停止圖片傳送任務")
 
+async def start_send_images():
+    global task
+    if task is None or task.done():
+        task = loop.create_task(send_images())
+        logger.info("創建新的 send_images 任務")
+
 async def send_images():
-    global user_page_url, running, last_task_check, last_image_url, task
+    global user_page_url, running, last_task_check, last_image_url
     logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
     while True:
         try:
-            await run_event.wait()  # 等待 running=True
+            await run_event.wait()
             if not running:
                 logger.info("圖片傳送任務因 running=False 而暫停")
                 break
@@ -219,9 +237,7 @@ async def send_images():
             logger.info("睡眠結束，繼續迴圈")
         except asyncio.CancelledError:
             logger.info(f"圖片傳送任務被取消，聊天 ID：{chat_id}")
-            running = False
             run_event.clear()
-            save_running_state(running)
             break
         except Exception as e:
             logger.error(f"圖片傳送流程異常：{e}\n{traceback.format_exc()}")
@@ -241,21 +257,28 @@ async def watchdog():
             task_status = task is not None and not task.done()
             task_exception = task.exception() if task and task.done() else None
             logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s, task_exception={task_exception}")
-            if running and (not task_status or task_exception or (current_time - last_task_check > 30)):
+            if running and (not task_status or task_exception or (current_time - last_task_check > 90)):
                 logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}, task_exception={task_exception}")
                 if task and not task.done():
                     task.cancel()
-                task = asyncio.create_task(send_images())
-                last_task_check = time.time()
+                running = True
+                save_running_state(running)
                 run_event.set()
+                task = loop.create_task(send_images())
+                last_task_check = time.time()
                 logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
+                # 通知用戶
+                try:
+                    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                    data = {"chat_id": chat_id, "text": "圖片傳送任務已重啟"}
+                    session.post(url, json=data, timeout=5).close()
+                except Exception as e:
+                    logger.error(f"通知用戶失敗：{e}")
             elif not running and task_status:
                 logger.warning("running=False 但任務仍在運行，取消任務")
                 task.cancel()
-                running = False
-                run_event.clear()
-                save_running_state(running)
-            await asyncio.sleep(10)  # 每 10 秒檢查
+                save_running_state(False)
+            await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"看門狗異常：{e}\n{traceback.format_exc()}")
             await asyncio.sleep(10)
@@ -281,9 +304,9 @@ async def keep_alive():
             await asyncio.sleep(300)
 
 def initialize_bot():
-    global updater, running, task, run_event
+    global updater, running, task, run_event, loop
     try:
-        # 載入運行狀態
+        run_event = asyncio.Event()
         running = load_running_state()
         logger.info(f"載入 running 狀態：{running}")
         if running:
@@ -322,9 +345,8 @@ def initialize_bot():
         asyncio.run_coroutine_threadsafe(watchdog(), loop)
         asyncio.run_coroutine_threadsafe(keep_alive(), loop)
         logger.info("看門狗和 Keep-alive 任務已啟動")
-        # 自動啟動圖片傳送任務（若 running=True）
         if running and (task is None or task.done()):
-            task = asyncio.create_task(send_images())
+            task = loop.create_task(send_images())
             last_task_check = time.time()
             logger.info(f"初始化時自動啟動圖片傳送任務，聊天 ID：{chat_id}")
     except Exception as e:
