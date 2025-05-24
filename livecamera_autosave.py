@@ -49,6 +49,9 @@ last_session_reset = time.time()
 RUNNING_STATE_FILE = "running.txt"
 RUNNING_STATE_ENV = "BOT_RUNNING_STATE"
 
+# 初始化 Flask 應用
+flask_app = Flask(__name__)
+
 def save_running_state(state):
     """儲存 running 狀態到檔案和環境變數"""
     try:
@@ -509,7 +512,6 @@ def health_check():
 
 if __name__ == "__main__":
     try:
-        flask_app = Flask(__name__)
         threading.Thread(target=run_event_loop, daemon=True).start()
         initialize_bot()
         port = int(os.getenv("PORT", 8443))
