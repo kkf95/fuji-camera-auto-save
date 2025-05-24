@@ -72,17 +72,17 @@ def load_running_state():
     """從檔案載入 running 狀態"""
     try:
         if not os.path.exists(RUNNING_STATE_FILE):
-            logger.warning(f"{RUNNING_STATE_FILE} 不存在，創建並設置 running=False")
-            save_running_state(False)
-            return False
+            logger.warning(f"{RUNNING_STATE_FILE} 不存在，預設 running=True 以確保自動恢復")
+            save_running_state(True)
+            return True
         with open(RUNNING_STATE_FILE, "r") as f:
             state = f.read().strip()
             logger.info(f"從 {RUNNING_STATE_FILE} 載入 running 狀態：{state}")
             return state.lower() == "true"
     except Exception as e:
         logger.error(f"載入 running 狀態失敗：{e}")
-        save_running_state(False)
-        return False
+        save_running_state(True)
+        return True
 
 async def get_latest_image_url(page_url):
     """從指定頁面爬取圖片網址和地點名稱"""
@@ -146,7 +146,6 @@ def start(update: Update, context: CallbackContext):
     save_running_state(running)
     update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
     if task is None or task.done():
-        # 在事件循環中創建任務
         asyncio.run_coroutine_threadsafe(start_send_images(), loop)
     logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
     global last_task_check
@@ -257,7 +256,22 @@ async def watchdog():
             task_status = task is not None and not task.done()
             task_exception = task.exception() if task and task.done() else None
             logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s, task_exception={task_exception}")
-            if running and (not task_status or task_exception or (current_time - last_task_check > 90)):
+            if running and not task_status:
+                logger.warning(f"檢測到任務未運行，last_task_check={last_task_check}, current_time={current_time}, task_exception={task_exception}")
+                running = True
+                save_running_state(running)
+                run_event.set()
+                task = loop.create_task(send_images())
+                last_task_check = time.time()
+                logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
+                # 通知用戶
+                try:
+                    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                    data = {"chat_id": chat_id, "text": "圖片傳送任務已啟動（服務重啟或任務停止後恢復）"}
+                    session.post(url, json=data, timeout=5).close()
+                except Exception as e:
+                    logger.error(f"通知用戶失敗：{e}")
+            elif running and (task_exception or (current_time - last_task_check > 90)):
                 logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}, task_exception={task_exception}")
                 if task and not task.done():
                     task.cancel()
@@ -349,6 +363,13 @@ def initialize_bot():
             task = loop.create_task(send_images())
             last_task_check = time.time()
             logger.info(f"初始化時自動啟動圖片傳送任務，聊天 ID：{chat_id}")
+            # 通知用戶
+            try:
+                url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                data = {"chat_id": chat_id, "text": "Bot 已啟動圖片傳送（服務重啟後恢復）"}
+                session.post(url, json=data, timeout=5).close()
+            except Exception as e:
+                logger.error(f"通知用戶失敗：{e}")
     except Exception as e:
         logger.error(f"初始化 Bot 失敗：{e}\n{traceback.format_exc()}")
         raise
