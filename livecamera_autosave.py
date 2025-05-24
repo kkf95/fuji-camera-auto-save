@@ -13,6 +13,7 @@ import sys
 import traceback
 import time
 import psutil
+import signal
 
 # 設置日誌
 logging.basicConfig(
@@ -36,58 +37,76 @@ DEFAULT_LOCATION = "鳴沢村活き活き広場"
 running = False
 task = None
 user_page_url = DEFAULT_PAGE_URL
-loop = None  # 將在 run_event_loop 中初始化
+loop = None
 last_task_check = 0
-chat_id = 48732810  # 固定聊天 ID
-session = requests.Session()  # HTTP 會話複用
-last_image_url = None  # 記錄上一次圖片網址
-run_event = None  # 將在 initialize_bot 中初始化
+chat_id = 48732810
+session = requests.Session()
+last_image_url = None
+run_event = None
+last_session_reset = time.time()
 
-# 持久化運行狀態檔案
+# 持久化運行狀態檔案和環境變數
 RUNNING_STATE_FILE = "running.txt"
-
-# Flask 應用
-flask_app = Flask(__name__)
-
-# Telegram Updater
-updater = None
+RUNNING_STATE_ENV = "BOT_RUNNING_STATE"
 
 def save_running_state(state):
-    """儲存 running 狀態到檔案"""
+    """儲存 running 狀態到檔案和環境變數"""
     try:
         with open(RUNNING_STATE_FILE, "w") as f:
             f.write(str(state))
         logger.info(f"儲存 running 狀態：{state} 到 {RUNNING_STATE_FILE}")
     except Exception as e:
-        logger.error(f"儲存 running 狀態失敗：{e}")
-        # 通知用戶
+        logger.error(f"儲存 running 狀態到檔案失敗：{e}")
+    try:
+        os.environ[RUNNING_STATE_ENV] = str(state)
+        logger.info(f"儲存 running 狀態：{state} 到環境變數 {RUNNING_STATE_ENV}")
+    except Exception as e:
+        logger.error(f"儲存 running 狀態到環境變數失敗：{e}")
+    if not state:
         try:
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            data = {"chat_id": chat_id, "text": f"錯誤：無法儲存運行狀態 ({e})"}
+            data = {"chat_id": chat_id, "text": f"Bot 已停止運行"}
             session.post(url, json=data, timeout=5).close()
         except Exception as notify_e:
             logger.error(f"通知用戶失敗：{notify_e}")
 
 def load_running_state():
-    """從檔案載入 running 狀態"""
+    """從檔案或環境變數載入 running 狀態"""
     try:
-        if not os.path.exists(RUNNING_STATE_FILE):
-            logger.warning(f"{RUNNING_STATE_FILE} 不存在，預設 running=True 以確保自動恢復")
-            save_running_state(True)
-            return True
-        with open(RUNNING_STATE_FILE, "r") as f:
-            state = f.read().strip()
-            logger.info(f"從 {RUNNING_STATE_FILE} 載入 running 狀態：{state}")
-            return state.lower() == "true"
+        env_state = os.getenv(RUNNING_STATE_ENV)
+        if env_state is not None:
+            state = env_state.lower() == "true"
+            logger.info(f"從環境變數 {RUNNING_STATE_ENV} 載入 running 狀態：{state}")
+            return state
+        if os.path.exists(RUNNING_STATE_FILE):
+            with open(RUNNING_STATE_FILE, "r") as f:
+                state = f.read().strip()
+                logger.info(f"從 {RUNNING_STATE_FILE} 載入 running 狀態：{state}")
+                return state.lower() == "true"
+        logger.warning(f"{RUNNING_STATE_FILE} 不存在，預設 running=True")
+        save_running_state(True)
+        return True
     except Exception as e:
         logger.error(f"載入 running 狀態失敗：{e}")
         save_running_state(True)
         return True
 
+def reset_session():
+    """重置 requests.Session 以釋放資源"""
+    global session, last_session_reset
+    try:
+        session.close()
+        session = requests.Session()
+        last_session_reset = time.time()
+        logger.info("已重置 requests.Session")
+    except Exception as e:
+        logger.error(f"重置 session 失敗：{e}")
+
 async def get_latest_image_url(page_url):
     """從指定頁面爬取圖片網址和地點名稱"""
     logger.info(f"開始爬取圖片網址，頁面：{page_url}")
     try:
+        start_time = time.time()
         response = session.get(page_url, timeout=5)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
@@ -95,7 +114,7 @@ async def get_latest_image_url(page_url):
         image_url = img_tag["src"] if img_tag and img_tag.get("src") else DEFAULT_IMAGE_URL
         location_tag = soup.find("span", class_="auto-style3")
         location = location_tag.text.strip().replace("/ ", "") if location_tag else DEFAULT_LOCATION
-        logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}")
+        logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}，耗時：{time.time() - start_time:.2f}s")
         return image_url, location
     except Exception as e:
         logger.error(f"爬取圖片網址或地點失敗：{e}\n{traceback.format_exc()}")
@@ -195,6 +214,8 @@ async def send_images():
     logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
     while True:
         try:
+            start_time = time.time()
+            logger.info(f"圖片傳送迴圈開始時間：{start_time}")
             await run_event.wait()
             if not running:
                 logger.info("圖片傳送任務因 running=False 而暫停")
@@ -209,15 +230,19 @@ async def send_images():
                 logger.info(f"圖片網址未變：{current_url}")
             request_url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
             logger.info(f"請求圖片網址：{request_url}")
+            request_start = time.time()
             response = session.get(request_url, timeout=5)
+            logger.info(f"圖片請求耗時：{time.time() - request_start:.2f}s")
             if response.status_code == 200:
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
                 caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: 富士五湖TV)"
                 logger.info(f"準備傳送圖片，caption：{caption}")
+                telegram_start = time.time()
                 url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
                 files = {"photo": response.content}
                 data = {"chat_id": chat_id, "caption": caption}
                 telegram_response = session.post(url, data=data, files=files, timeout=5)
+                logger.info(f"Telegram 傳送耗時：{time.time() - telegram_start:.2f}s")
                 if telegram_response.status_code == 200:
                     logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}")
                 else:
@@ -227,10 +252,15 @@ async def send_images():
             else:
                 logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
                 response.close()
-            # 記錄內存使用
             process = psutil.Process()
             mem_info = process.memory_info()
             logger.info(f"內存使用：RSS={mem_info.rss / 1024 / 1024:.2f}MB, VMS={mem_info.vms / 1024 / 1024:.2f}MB")
+            if mem_info.rss / 1024 / 1024 > 400:
+                logger.warning("內存使用接近限制，嘗試重置 session")
+                reset_session()
+            if time.time() - last_session_reset > 3600:
+                logger.info("定時重置 session")
+                reset_session()
             logger.info("即將進入 60 秒睡眠")
             await asyncio.sleep(60)
             logger.info("睡眠結束，繼續迴圈")
@@ -240,9 +270,15 @@ async def send_images():
             break
         except Exception as e:
             logger.error(f"圖片傳送流程異常：{e}\n{traceback.format_exc()}")
+            try:
+                url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                data = {"chat_id": chat_id, "text": f"圖片傳送異常：{str(e)}，將在 10 秒後重試"}
+                session.post(url, json=data, timeout=5).close()
+            except Exception as notify_e:
+                logger.error(f"通知用戶失敗：{notify_e}")
             await asyncio.sleep(10)
         finally:
-            logger.info("圖片傳送迴圈結束，檢查 running 狀態")
+            logger.info(f"圖片傳送迴圈結束，運行時間：{time.time() - start_time:.2f}s，檢查 running 狀態")
             if not running:
                 logger.info("因 running=False 退出 send_images")
                 break
@@ -250,28 +286,16 @@ async def send_images():
 async def watchdog():
     global running, task, last_task_check
     logger.info("看門狗任務啟動")
+    last_notify_time = 0
     while True:
         try:
             current_time = time.time()
             task_status = task is not None and not task.done()
             task_exception = task.exception() if task and task.done() else None
-            logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s, task_exception={task_exception}")
-            if running and not task_status:
-                logger.warning(f"檢測到任務未運行，last_task_check={last_task_check}, current_time={current_time}, task_exception={task_exception}")
-                running = True
-                save_running_state(running)
-                run_event.set()
-                task = loop.create_task(send_images())
-                last_task_check = time.time()
-                logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
-                # 通知用戶
-                try:
-                    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                    data = {"chat_id": chat_id, "text": "圖片傳送任務已啟動（服務重啟或任務停止後恢復）"}
-                    session.post(url, json=data, timeout=5).close()
-                except Exception as e:
-                    logger.error(f"通知用戶失敗：{e}")
-            elif running and (task_exception or (current_time - last_task_check > 90)):
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s, task_exception={task_exception}, memory_rss={mem_info.rss / 1024 / 1024:.2f}MB")
+            if running and (not task_status or task_exception or (current_time - last_task_check > 90)):
                 logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}, task_exception={task_exception}")
                 if task and not task.done():
                     task.cancel()
@@ -281,17 +305,36 @@ async def watchdog():
                 task = loop.create_task(send_images())
                 last_task_check = time.time()
                 logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
-                # 通知用戶
-                try:
-                    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                    data = {"chat_id": chat_id, "text": "圖片傳送任務已重啟"}
-                    session.post(url, json=data, timeout=5).close()
-                except Exception as e:
-                    logger.error(f"通知用戶失敗：{e}")
+                if current_time - last_notify_time > 300:
+                    try:
+                        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                        data = {"chat_id": chat_id, "text": "圖片傳送任務已重啟"}
+                        session.post(url, json=data, timeout=5).close()
+                        last_notify_time = current_time
+                    except Exception as e:
+                        logger.error(f"通知用戶失敗：{e}")
             elif not running and task_status:
                 logger.warning("running=False 但任務仍在運行，取消任務")
                 task.cancel()
                 save_running_state(False)
+            elif not running and (current_time - last_task_check > 600):
+                if current_time - last_notify_time > 600:
+                    logger.warning("任務長時間未運行，通知用戶")
+                    try:
+                        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                        data = {"chat_id": chat_id, "text": "Bot 已停止，請使用 /start 或 /resume 恢復"}
+                        session.post(url, json=data, timeout=5).close()
+                        last_notify_time = current_time
+                    except Exception as e:
+                        logger.error(f"通知用戶失敗：{e}")
+            if mem_info.rss / 1024 / 1024 > 450:
+                logger.warning("內存使用過高，可能導致服務終止")
+                try:
+                    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                    data = {"chat_id": chat_id, "text": f"警告：內存使用過高 ({mem_info.rss / 1024 / 1024:.2f}MB)，可能導致服務終止"}
+                    session.post(url, json=data, timeout=5).close()
+                except Exception as e:
+                    logger.error(f"通知用戶失敗：{e}")
             await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"看門狗異常：{e}\n{traceback.format_exc()}")
@@ -317,14 +360,35 @@ async def keep_alive():
             logger.error(f"Keep-alive 異常：{e}\n{traceback.format_exc()}")
             await asyncio.sleep(300)
 
+def signal_handler(sig, frame):
+    """處理服務終止信號"""
+    logger.info(f"收到信號 {sig}，保存 running 狀態並關閉服務")
+    save_running_state(running)
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        data = {"chat_id": chat_id, "text": "服務即將終止，將嘗試在重啟後恢復"}
+        session.post(url, json=data, timeout=5).close()
+    except Exception as e:
+        logger.error(f"通知用戶失敗：{e}")
+    sys.exit(0)
+
 def initialize_bot():
     global updater, running, task, run_event, loop
     try:
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
         run_event = asyncio.Event()
         running = load_running_state()
         logger.info(f"載入 running 狀態：{running}")
         if running:
             run_event.set()
+            logger.info("檢測到 running=True，準備自動恢復圖片傳送")
+            try:
+                url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                data = {"chat_id": chat_id, "text": "服務已重啟，自動恢復圖片傳送"}
+                session.post(url, json=data, timeout=5).close()
+            except Exception as e:
+                logger.error(f"通知用戶失敗：{e}")
         updater = Updater(TOKEN, use_context=True)
         dispatcher = updater.dispatcher
         dispatcher.add_handler(CommandHandler("seturl", seturl))
@@ -363,15 +427,14 @@ def initialize_bot():
             task = loop.create_task(send_images())
             last_task_check = time.time()
             logger.info(f"初始化時自動啟動圖片傳送任務，聊天 ID：{chat_id}")
-            # 通知用戶
-            try:
-                url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                data = {"chat_id": chat_id, "text": "Bot 已啟動圖片傳送（服務重啟後恢復）"}
-                session.post(url, json=data, timeout=5).close()
-            except Exception as e:
-                logger.error(f"通知用戶失敗：{e}")
     except Exception as e:
         logger.error(f"初始化 Bot 失敗：{e}\n{traceback.format_exc()}")
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            data = {"chat_id": chat_id, "text": f"初始化 Bot 失敗：{str(e)}"}
+            session.post(url, json=data, timeout=5).close()
+        except Exception as notify_e:
+            logger.error(f"通知用戶失敗：{notify_e}")
         raise
     finally:
         for resp in [r for r in locals().values() if isinstance(r, requests.Response)]:
@@ -384,10 +447,16 @@ def run_event_loop():
         asyncio.set_event_loop(loop)
         logger.info("事件循環啟動")
         loop.run_forever()
-    except KeyboardInterrupt:
-        logger.info("收到鍵盤中斷，關閉事件循環")
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("收到終止信號，關閉事件循環")
     except Exception as e:
         logger.error(f"事件循環異常停止：{e}\n{traceback.format_exc()}")
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            data = {"chat_id": chat_id, "text": f"事件循環異常：{str(e)}"}
+            session.post(url, json=data, timeout=5).close()
+        except Exception as notify_e:
+            logger.error(f"通知用戶失敗：{notify_e}")
     finally:
         logger.info("關閉事件循環")
         pending = asyncio.all_tasks(loop)
@@ -420,22 +489,27 @@ def webhook():
 def health_check():
     logger.info("收到健康檢查請求")
     global running, task
-    process = psutil.Process()
-    mem_info = process.memory_info()
-    task_exception = task.exception() if task and task.done() else None
-    status = {
-        "running": running,
-        "task_active": task is not None and not task.done(),
-        "last_task_check": last_task_check,
-        "timestamp": time.time(),
-        "memory_rss_mb": mem_info.rss / 1024 / 1024,
-        "memory_vms_mb": mem_info.vms / 1024 / 1024,
-        "task_exception": str(task_exception) if task_exception else None
-    }
-    return Response(f"Bot is running: {status}", status=200)
+    try:
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        task_exception = task.exception() if task and task.done() else None
+        status = {
+            "running": running,
+            "task_active": task is not None and not task.done(),
+            "last_task_check": last_task_check,
+            "timestamp": time.time(),
+            "memory_rss_mb": mem_info.rss / 1024 / 1024,
+            "memory_vms_mb": mem_info.vms / 1024 / 1024,
+            "task_exception": str(task_exception) if task_exception else None
+        }
+        return Response(f"Bot is running: {status}", status=200)
+    except Exception as e:
+        logger.error(f"健康檢查失敗：{e}\n{traceback.format_exc()}")
+        return Response("Health check failed", status=500)
 
 if __name__ == "__main__":
     try:
+        flask_app = Flask(__name__)
         threading.Thread(target=run_event_loop, daemon=True).start()
         initialize_bot()
         port = int(os.getenv("PORT", 8443))
@@ -443,3 +517,9 @@ if __name__ == "__main__":
         flask_app.run(host="0.0.0.0", port=port)
     except Exception as e:
         logger.error(f"主程式異常：{e}\n{traceback.format_exc()}")
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            data = {"chat_id": chat_id, "text": f"主程式異常：{str(e)}"}
+            session.post(url, json=data, timeout=5).close()
+        except Exception as notify_e:
+            logger.error(f"通知用戶失敗：{notify_e}")
