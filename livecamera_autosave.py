@@ -14,6 +14,7 @@ import traceback
 import time
 import psutil
 import signal
+import platform
 
 # 設置日誌
 logging.basicConfig(
@@ -257,7 +258,8 @@ async def send_images():
                 response.close()
             process = psutil.Process()
             mem_info = process.memory_info()
-            logger.info(f"內存使用：RSS={mem_info.rss / 1024 / 1024:.2f}MB, VMS={mem_info.vms / 1024 / 1024:.2f}MB")
+            cpu_percent = psutil.cpu_percent(interval=None)
+            logger.info(f"內存使用：RSS={mem_info.rss / 1024 / 1024:.2f}MB, VMS={mem_info.vms / 1024 / 1024:.2f}MB, CPU={cpu_percent:.1f}%")
             if mem_info.rss / 1024 / 1024 > 400:
                 logger.warning("內存使用接近限制，嘗試重置 session")
                 reset_session()
@@ -297,7 +299,8 @@ async def watchdog():
             task_exception = task.exception() if task and task.done() else None
             process = psutil.Process()
             mem_info = process.memory_info()
-            logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s, task_exception={task_exception}, memory_rss={mem_info.rss / 1024 / 1024:.2f}MB")
+            cpu_percent = psutil.cpu_percent(interval=None)
+            logger.info(f"看門狗檢查：running={running}, task_exists={task is not None}, task_done={task.done() if task else True}, last_task_check={current_time - last_task_check:.2f}s, task_exception={task_exception}, memory_rss={mem_info.rss / 1024 / 1024:.2f}MB, cpu_percent={cpu_percent:.1f}%")
             if running and (not task_status or task_exception or (current_time - last_task_check > 90)):
                 logger.warning(f"檢測到任務可能停止，last_task_check={last_task_check}, current_time={current_time}, task_exception={task_exception}")
                 if task and not task.done():
@@ -338,6 +341,14 @@ async def watchdog():
                     session.post(url, json=data, timeout=5).close()
                 except Exception as e:
                     logger.error(f"通知用戶失敗：{e}")
+            if cpu_percent > 90:
+                logger.warning("CPU 使用率過高，可能導致服務終止")
+                try:
+                    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                    data = {"chat_id": chat_id, "text": f"警告：CPU 使用率過高 ({cpu_percent:.1f}%)，可能導致服務終止"}
+                    session.post(url, json=data, timeout=5).close()
+                except Exception as e:
+                    logger.error(f"通知用戶失敗：{e}")
             await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"看門狗異常：{e}\n{traceback.format_exc()}")
@@ -369,7 +380,7 @@ def signal_handler(sig, frame):
     save_running_state(running)
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        data = {"chat_id": chat_id, "text": "服務即將終止，將嘗試在重啟後恢復"}
+        data = {"chat_id": chat_id, "text": f"服務即將終止（信號 {sig}），將嘗試在重啟後恢復"}
         session.post(url, json=data, timeout=5).close()
     except Exception as e:
         logger.error(f"通知用戶失敗：{e}")
@@ -383,12 +394,16 @@ def initialize_bot():
         run_event = asyncio.Event()
         running = load_running_state()
         logger.info(f"載入 running 狀態：{running}")
+        # 記錄環境變數和系統資訊
+        env_vars = {k: "****" if k in ["TELEGRAM_BOT_TOKEN", "GITHUB_TOKEN", "GITHUB_ACCESS_TOKEN"] else v for k, v in os.environ.items()}
+        logger.info(f"環境變數：{env_vars}")
+        logger.info(f"系統資訊：Python {sys.version}, Platform {platform.platform()}, CPUs {psutil.cpu_count()}")
         if running:
             run_event.set()
             logger.info("檢測到 running=True，準備自動恢復圖片傳送")
             try:
                 url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                data = {"chat_id": chat_id, "text": "服務已重啟，自動恢復圖片傳送"}
+                data = {"chat_id": chat_id, "text": f"服務已重啟，自動恢復圖片傳送，時間：{datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m-%d JST %H:%M')}"}
                 session.post(url, json=data, timeout=5).close()
             except Exception as e:
                 logger.error(f"通知用戶失敗：{e}")
@@ -495,6 +510,7 @@ def health_check():
     try:
         process = psutil.Process()
         mem_info = process.memory_info()
+        cpu_percent = psutil.cpu_percent(interval=None)
         task_exception = task.exception() if task and task.done() else None
         status = {
             "running": running,
@@ -503,8 +519,10 @@ def health_check():
             "timestamp": time.time(),
             "memory_rss_mb": mem_info.rss / 1024 / 1024,
             "memory_vms_mb": mem_info.vms / 1024 / 1024,
+            "cpu_percent": cpu_percent,
             "task_exception": str(task_exception) if task_exception else None
         }
+        logger.info(f"健康檢查狀態：{status}")
         return Response(f"Bot is running: {status}", status=200)
     except Exception as e:
         logger.error(f"健康檢查失敗：{e}\n{traceback.format_exc()}")
@@ -512,6 +530,7 @@ def health_check():
 
 if __name__ == "__main__":
     try:
+        logger.info("主程式啟動")
         threading.Thread(target=run_event_loop, daemon=True).start()
         initialize_bot()
         port = int(os.getenv("PORT", 8443))
