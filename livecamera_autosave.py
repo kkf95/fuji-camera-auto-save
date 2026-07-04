@@ -3,7 +3,7 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram.ext import Updater, CommandHandler, CallbackContext, Filters
 from bs4 import BeautifulSoup
 import os
 from flask import Flask, request, Response
@@ -36,9 +36,9 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 # 系統通知（報錯、重啟、警告）只發送給管理員
 ADMIN_CHAT_ID = 48732810  
 
-# 圖片發送目標清單（包含頻道 ID 與您的個人 ID）
-# ⚠️ 請務必將 -1001234567890 替換為您的實際頻道 ID
-TARGET_CHAT_IDS = [-1004310110864, 48732810]  
+# 預設發送目標 (您的頻道 ID)
+# 當使用 /start 時，此列表會被動態覆蓋為下指令的頻道/聊天室 ID
+TARGET_CHAT_IDS = [-1004310110864]  
 # -----------------
 
 # 更新為新的預設網址
@@ -172,12 +172,12 @@ async def get_latest_image_url(page_url):
 def seturl(update: Update, context: CallbackContext):
     global user_page_url
     if not context.args:
-        update.message.reply_text("請提供網址！用法：/seturl <網址>")
+        update.effective_message.reply_text("請提供網址！用法：/seturl <網址>")
         return
 
     new_url = context.args[0]
     if not new_url.startswith("http"):
-        update.message.reply_text("請提供有效的網址（以 http 或 https 開頭）！")
+        update.effective_message.reply_text("請提供有效的網址（以 http 或 https 開頭）！")
         return
 
     try:
@@ -189,30 +189,35 @@ def seturl(update: Update, context: CallbackContext):
         meta_img = soup.find("meta", property="og:image")
         
         if not (img_tag and img_tag.get("src")) and not (meta_img and meta_img.get("content")):
-            update.message.reply_text("該網址無效，無法找到圖片來源！")
+            update.effective_message.reply_text("該網址無效，無法找到圖片來源！")
             return
     except Exception as e:
-        update.message.reply_text(f"錯誤：無法訪問網址 ({str(e)})")
+        update.effective_message.reply_text(f"錯誤：無法訪問網址 ({str(e)})")
         return
     finally:
         if 'response' in locals():
             response.close()
 
     user_page_url = new_url
-    update.message.reply_text(f"網址已設定為：{new_url}\n使用 /start 開始傳送圖片。")
-    logger.info(f"網址設定為：{new_url}，由使用者 {update.effective_chat.id} 執行")
+    update.effective_message.reply_text(f"網址已設定為：{new_url}\n使用 /start 開始傳送圖片。")
+    logger.info(f"網址設定為：{new_url}，由 {update.effective_chat.id} 執行")
 
 def start(update: Update, context: CallbackContext):
-    global running, task, run_event
+    global running, task, run_event, TARGET_CHAT_IDS
+    
+    # 抓取當前下指令的聊天室/頻道 ID
+    current_chat_id = update.effective_chat.id
+    TARGET_CHAT_IDS = [current_chat_id]
+    
     if running:
-        update.message.reply_text("Bot 已經在運行！")
+        update.effective_message.reply_text("Bot 已經在運行！")
         return
 
-    logger.info(f"收到 /start 指令，由使用者 {update.effective_chat.id} 執行")
+    logger.info(f"收到 /start 指令，目標已鎖定為 {current_chat_id}")
     running = True
     run_event.set()
     save_running_state(running)
-    update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
+    update.effective_message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片至此。使用 /stop 停止。")
     if task is None or task.done():
         asyncio.run_coroutine_threadsafe(start_send_images(), loop)
     logger.info("啟動圖片傳送任務")
@@ -222,14 +227,14 @@ def start(update: Update, context: CallbackContext):
 def resume(update: Update, context: CallbackContext):
     global running, task, run_event
     if running:
-        update.message.reply_text("Bot 已經在運行！")
+        update.effective_message.reply_text("Bot 已經在運行！")
         return
 
-    logger.info(f"收到 /resume 指令，由使用者 {update.effective_chat.id} 執行")
+    logger.info(f"收到 /resume 指令，由 {update.effective_chat.id} 執行")
     running = True
     run_event.set()
     save_running_state(running)
-    update.message.reply_text("Bot 已恢復，將每分鐘傳送圖片。")
+    update.effective_message.reply_text("Bot 已恢復，將每分鐘傳送圖片至設定目標。")
     if task is None or task.done():
         asyncio.run_coroutine_threadsafe(start_send_images(), loop)
     logger.info("恢復圖片傳送任務")
@@ -239,17 +244,17 @@ def resume(update: Update, context: CallbackContext):
 def stop(update: Update, context: CallbackContext):
     global running, task, run_event
     if not running:
-        update.message.reply_text("Bot 已經停止！")
+        update.effective_message.reply_text("Bot 已經停止！")
         return
 
-    logger.info(f"收到 /stop 指令，由使用者 {update.effective_chat.id} 執行")
+    logger.info(f"收到 /stop 指令，由 {update.effective_chat.id} 執行")
     running = False
     run_event.clear()
     save_running_state(running)
     if task and not task.done():
         task.cancel()
         logger.info("任務已取消")
-    update.message.reply_text("Bot 已停止。使用 /resume 恢復。")
+    update.effective_message.reply_text("Bot 已停止。使用 /resume 恢復。")
     logger.info("停止圖片傳送任務")
 
 async def start_send_images():
@@ -474,10 +479,13 @@ def initialize_bot():
                 logger.error(f"通知管理員失敗：{e}")
         updater = Updater(TOKEN, use_context=True)
         dispatcher = updater.dispatcher
-        dispatcher.add_handler(CommandHandler("seturl", seturl))
-        dispatcher.add_handler(CommandHandler("start", start))
-        dispatcher.add_handler(CommandHandler("resume", resume))
-        dispatcher.add_handler(CommandHandler("stop", stop))
+        
+        # 使用 Filters.all 確保能收到頻道指令
+        dispatcher.add_handler(CommandHandler("seturl", seturl, filters=Filters.all))
+        dispatcher.add_handler(CommandHandler("start", start, filters=Filters.all))
+        dispatcher.add_handler(CommandHandler("resume", resume, filters=Filters.all))
+        dispatcher.add_handler(CommandHandler("stop", stop, filters=Filters.all))
+        
         response = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/setMyCommands",
             json={
@@ -599,7 +607,7 @@ if __name__ == "__main__":
         threading.Thread(target=run_event_loop, daemon=True).start()
         initialize_bot()
         port = int(os.getenv("PORT", 8443))
-        logger.info(f"啟動 Flask 伺服器，端口：{port}")
+        logger.info(f"啟啟 Flask 伺服器，端口：{port}")
         flask_app.run(host="0.0.0.0", port=port)
     except Exception as e:
         logger.error(f"主程式異常：{e}\n{traceback.format_exc()}")
