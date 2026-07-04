@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
+# --- ID 設定區 ---
+# 系統通知（報錯、重啟、警告）只發送給管理員
+ADMIN_CHAT_ID = 48732810  
+
+# 圖片發送目標清單（包含頻道 ID 與您的個人 ID）
+# ⚠️ 請務必將 -1001234567890 替換為您的實際頻道 ID
+TARGET_CHAT_IDS = [-1004310110864, 48732810]  
+# -----------------
+
 # 更新為新的預設網址
 DEFAULT_PAGE_URL = "https://fujiyama.tv/live/?n=26&b=0"
 DEFAULT_IMAGE_URL = "https://fujiyama.tv/live/camimg.php?n=26&img=cam.jpg"
@@ -43,7 +52,6 @@ task = None
 user_page_url = DEFAULT_PAGE_URL
 loop = None
 last_task_check = 0
-chat_id = 48732810  # 您的 Chat ID
 session = requests.Session()
 last_image_url = None
 run_event = None
@@ -72,7 +80,7 @@ def save_running_state(state):
     if not state:
         try:
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            data = {"chat_id": chat_id, "text": f"Bot 已停止運行"}
+            data = {"chat_id": ADMIN_CHAT_ID, "text": f"Bot 已停止運行"}
             session.post(url, json=data, timeout=5).close()
         except Exception as notify_e:
             logger.error(f"通知用戶失敗：{notify_e}")
@@ -118,7 +126,7 @@ async def get_latest_image_url(page_url):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # 1. 獲取圖片網址：優先找 img#mov，若無則尋找 meta 標籤
+        # 1. 獲取圖片網址
         img_tag = soup.find("img", id="mov")
         if img_tag and img_tag.get("src"):
             image_url = img_tag["src"]
@@ -129,7 +137,7 @@ async def get_latest_image_url(page_url):
             else:
                 image_url = DEFAULT_IMAGE_URL
                 
-        # 處理相對路徑 (例如 /live/camimg.php...)
+        # 處理相對路徑
         if image_url.startswith("/"):
             parsed_url = urlparse(page_url)
             base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -142,7 +150,6 @@ async def get_latest_image_url(page_url):
         if location_tag:
             location = location_tag.text.strip().replace("/ ", "")
         else:
-            # 備用方案：從 Title 提取 (格式如: 富士山ライブカメラ-鳴沢村活き活き広場 | ...)
             title_tag = soup.find("title")
             if title_tag:
                 title_text = title_tag.text
@@ -178,7 +185,6 @@ def seturl(update: Update, context: CallbackContext):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # 相容新舊版本的圖片檢查
         img_tag = soup.find("img", id="mov")
         meta_img = soup.find("meta", property="og:image")
         
@@ -194,7 +200,7 @@ def seturl(update: Update, context: CallbackContext):
 
     user_page_url = new_url
     update.message.reply_text(f"網址已設定為：{new_url}\n使用 /start 開始傳送圖片。")
-    logger.info(f"網址設定為：{new_url}，聊天 ID：{update.effective_chat.id}")
+    logger.info(f"網址設定為：{new_url}，由使用者 {update.effective_chat.id} 執行")
 
 def start(update: Update, context: CallbackContext):
     global running, task, run_event
@@ -202,14 +208,14 @@ def start(update: Update, context: CallbackContext):
         update.message.reply_text("Bot 已經在運行！")
         return
 
-    logger.info(f"收到 /start 指令，聊天 ID：{chat_id}")
+    logger.info(f"收到 /start 指令，由使用者 {update.effective_chat.id} 執行")
     running = True
     run_event.set()
     save_running_state(running)
     update.message.reply_text("Bot 已啟動，將每分鐘傳送最新圖片。使用 /stop 停止。")
     if task is None or task.done():
         asyncio.run_coroutine_threadsafe(start_send_images(), loop)
-    logger.info(f"啟動圖片傳送任務，聊天 ID：{chat_id}")
+    logger.info("啟動圖片傳送任務")
     global last_task_check
     last_task_check = time.time()
 
@@ -219,14 +225,14 @@ def resume(update: Update, context: CallbackContext):
         update.message.reply_text("Bot 已經在運行！")
         return
 
-    logger.info(f"收到 /resume 指令，聊天 ID：{chat_id}")
+    logger.info(f"收到 /resume 指令，由使用者 {update.effective_chat.id} 執行")
     running = True
     run_event.set()
     save_running_state(running)
     update.message.reply_text("Bot 已恢復，將每分鐘傳送圖片。")
     if task is None or task.done():
         asyncio.run_coroutine_threadsafe(start_send_images(), loop)
-    logger.info(f"恢復圖片傳送任務，聊天 ID：{chat_id}")
+    logger.info("恢復圖片傳送任務")
     global last_task_check
     last_task_check = time.time()
 
@@ -236,7 +242,7 @@ def stop(update: Update, context: CallbackContext):
         update.message.reply_text("Bot 已經停止！")
         return
 
-    logger.info(f"收到 /stop 指令，聊天 ID：{chat_id}")
+    logger.info(f"收到 /stop 指令，由使用者 {update.effective_chat.id} 執行")
     running = False
     run_event.clear()
     save_running_state(running)
@@ -254,7 +260,7 @@ async def start_send_images():
 
 async def send_images():
     global user_page_url, running, last_task_check, last_image_url
-    logger.info(f"開始圖片傳送循環，聊天 ID：{chat_id}")
+    logger.info("開始圖片傳送循環")
     while True:
         try:
             start_time = time.time()
@@ -273,7 +279,6 @@ async def send_images():
             else:
                 logger.info(f"圖片網址未變：{current_url}")
                 
-            # 修正 URL Cache-Buster：保留原本的 GET 參數 (如 n=26&img=cam.jpg)
             if "?" in current_url:
                 request_url = f"{current_url}&_t={int(time.time() * 1000)}"
             else:
@@ -286,21 +291,29 @@ async def send_images():
             
             if response.status_code == 200:
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
-                # Source 名稱已變更為 Fujiyama.TV
                 caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: Fujiyama.TV)"
                 logger.info(f"準備傳送圖片，caption：{caption}")
                 telegram_start = time.time()
                 url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-                files = {"photo": response.content}
-                data = {"chat_id": chat_id, "caption": caption}
-                telegram_response = session.post(url, data=data, files=files, timeout=5)
-                logger.info(f"Telegram 傳送耗時：{time.time() - telegram_start:.2f}s")
-                if telegram_response.status_code == 200:
-                    logger.info(f"圖片傳送成功，網址：{current_url}，地點：{location}，時間：{caption}")
-                else:
-                    logger.error(f"圖片傳送失敗，狀態碼：{telegram_response.status_code}，回應：{telegram_response.text}")
+                
+                # 緩存圖片內容供群發使用
+                photo_data = response.content
+                
+                # 迴圈發送至所有目標 ID
+                for target_id in TARGET_CHAT_IDS:
+                    files = {"photo": photo_data}
+                    data = {"chat_id": target_id, "caption": caption}
+                    telegram_response = session.post(url, data=data, files=files, timeout=5)
+                    
+                    if telegram_response.status_code == 200:
+                        logger.info(f"圖片已成功傳送給 ID: {target_id}")
+                    else:
+                        logger.error(f"傳送給 {target_id} 失敗，狀態碼：{telegram_response.status_code}，錯誤：{telegram_response.text}")
+                    telegram_response.close()
+                    
+                logger.info(f"Telegram 全體傳送耗時：{time.time() - telegram_start:.2f}s")
+                logger.info(f"圖片傳送流程完畢，網址：{current_url}，地點：{location}，時間：{caption}")
                 response.close()
-                telegram_response.close()
             else:
                 logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
                 response.close()
@@ -309,27 +322,31 @@ async def send_images():
             mem_info = process.memory_info()
             cpu_percent = psutil.cpu_percent(interval=None)
             logger.info(f"內存使用：RSS={mem_info.rss / 1024 / 1024:.2f}MB, VMS={mem_info.vms / 1024 / 1024:.2f}MB, CPU={cpu_percent:.1f}%")
+            
             if mem_info.rss / 1024 / 1024 > 400:
                 logger.warning("內存使用接近限制，嘗試重置 session")
                 reset_session()
             if time.time() - last_session_reset > 3600:
                 logger.info("定時重置 session")
                 reset_session()
+                
             logger.info("即將進入 60 秒睡眠")
             await asyncio.sleep(60)
             logger.info("睡眠結束，繼續迴圈")
+            
         except asyncio.CancelledError:
-            logger.info(f"圖片傳送任務被取消，聊天 ID：{chat_id}")
+            logger.info("圖片傳送任務被取消")
             run_event.clear()
             break
         except Exception as e:
             logger.error(f"圖片傳送流程異常：{e}\n{traceback.format_exc()}")
             try:
                 url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                data = {"chat_id": chat_id, "text": f"圖片傳送異常：{str(e)}，將在 10 秒後重試"}
+                # 錯誤訊息只傳給管理員
+                data = {"chat_id": ADMIN_CHAT_ID, "text": f"圖片傳送異常：{str(e)}，將在 10 秒後重試"}
                 session.post(url, json=data, timeout=5).close()
             except Exception as notify_e:
-                logger.error(f"通知用戶失敗：{notify_e}")
+                logger.error(f"通知管理員失敗：{notify_e}")
             await asyncio.sleep(10)
         finally:
             logger.info(f"圖片傳送迴圈結束，運行時間：{time.time() - start_time:.2f}s，檢查 running 狀態")
@@ -359,45 +376,45 @@ async def watchdog():
                 run_event.set()
                 task = loop.create_task(send_images())
                 last_task_check = time.time()
-                logger.info(f"重啟圖片傳送任務，聊天 ID：{chat_id}")
+                logger.info("重啟圖片傳送任務")
                 if current_time - last_notify_time > 300:
                     try:
                         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                        data = {"chat_id": chat_id, "text": "圖片傳送任務已重啟"}
+                        data = {"chat_id": ADMIN_CHAT_ID, "text": "系統通知：圖片傳送任務已重啟"}
                         session.post(url, json=data, timeout=5).close()
                         last_notify_time = current_time
                     except Exception as e:
-                        logger.error(f"通知用戶失敗：{e}")
+                        logger.error(f"通知管理員失敗：{e}")
             elif not running and task_status:
                 logger.warning("running=False 但任務仍在運行，取消任務")
                 task.cancel()
                 save_running_state(False)
             elif not running and (current_time - last_task_check > 600):
                 if current_time - last_notify_time > 600:
-                    logger.warning("任務長時間未運行，通知用戶")
+                    logger.warning("任務長時間未運行，通知管理員")
                     try:
                         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                        data = {"chat_id": chat_id, "text": "Bot 已停止，請使用 /start 或 /resume 恢復"}
+                        data = {"chat_id": ADMIN_CHAT_ID, "text": "系統通知：Bot 已停止，請使用 /start 或 /resume 恢復"}
                         session.post(url, json=data, timeout=5).close()
                         last_notify_time = current_time
                     except Exception as e:
-                        logger.error(f"通知用戶失敗：{e}")
+                        logger.error(f"通知管理員失敗：{e}")
             if mem_info.rss / 1024 / 1024 > 450:
                 logger.warning("內存使用過高，可能導致服務終止")
                 try:
                     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                    data = {"chat_id": chat_id, "text": f"警告：內存使用過高 ({mem_info.rss / 1024 / 1024:.2f}MB)，可能導致服務終止"}
+                    data = {"chat_id": ADMIN_CHAT_ID, "text": f"警告：內存使用過高 ({mem_info.rss / 1024 / 1024:.2f}MB)，可能導致服務終止"}
                     session.post(url, json=data, timeout=5).close()
                 except Exception as e:
-                    logger.error(f"通知用戶失敗：{e}")
+                    logger.error(f"通知管理員失敗：{e}")
             if cpu_percent > 90:
                 logger.warning("CPU 使用率過高，可能導致服務終止")
                 try:
                     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                    data = {"chat_id": chat_id, "text": f"警告：CPU 使用率過高 ({cpu_percent:.1f}%)，可能導致服務終止"}
+                    data = {"chat_id": ADMIN_CHAT_ID, "text": f"警告：CPU 使用率過高 ({cpu_percent:.1f}%)，可能導致服務終止"}
                     session.post(url, json=data, timeout=5).close()
                 except Exception as e:
-                    logger.error(f"通知用戶失敗：{e}")
+                    logger.error(f"通知管理員失敗：{e}")
             await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"看門狗異常：{e}\n{traceback.format_exc()}")
@@ -409,7 +426,7 @@ async def keep_alive():
         try:
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
             data = {
-                "chat_id": chat_id,
+                "chat_id": ADMIN_CHAT_ID,
                 "text": f"Bot is alive at {datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m-%d JST %H:%M')}"
             }
             response = session.post(url, json=data, timeout=5)
@@ -429,10 +446,10 @@ def signal_handler(sig, frame):
     save_running_state(running)
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        data = {"chat_id": chat_id, "text": f"服務即將終止（信號 {sig}），將嘗試在重啟後恢復"}
+        data = {"chat_id": ADMIN_CHAT_ID, "text": f"服務即將終止（信號 {sig}），將嘗試在重啟後恢復"}
         session.post(url, json=data, timeout=5).close()
     except Exception as e:
-        logger.error(f"通知用戶失敗：{e}")
+        logger.error(f"通知管理員失敗：{e}")
     sys.exit(0)
 
 def initialize_bot():
@@ -451,10 +468,10 @@ def initialize_bot():
             logger.info("檢測到 running=True，準備自動恢復圖片傳送")
             try:
                 url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                data = {"chat_id": chat_id, "text": f"服務已重啟，自動恢復圖片傳送，時間：{datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m-%d JST %H:%M')}"}
+                data = {"chat_id": ADMIN_CHAT_ID, "text": f"服務已重啟，自動恢復圖片傳送，時間：{datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m-%d JST %H:%M')}"}
                 session.post(url, json=data, timeout=5).close()
             except Exception as e:
-                logger.error(f"通知用戶失敗：{e}")
+                logger.error(f"通知管理員失敗：{e}")
         updater = Updater(TOKEN, use_context=True)
         dispatcher = updater.dispatcher
         dispatcher.add_handler(CommandHandler("seturl", seturl))
@@ -492,15 +509,15 @@ def initialize_bot():
         if running and (task is None or task.done()):
             task = loop.create_task(send_images())
             last_task_check = time.time()
-            logger.info(f"初始化時自動啟動圖片傳送任務，聊天 ID：{chat_id}")
+            logger.info("初始化時自動啟動圖片傳送任務")
     except Exception as e:
         logger.error(f"初始化 Bot 失敗：{e}\n{traceback.format_exc()}")
         try:
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            data = {"chat_id": chat_id, "text": f"初始化 Bot 失敗：{str(e)}"}
+            data = {"chat_id": ADMIN_CHAT_ID, "text": f"初始化 Bot 失敗：{str(e)}"}
             session.post(url, json=data, timeout=5).close()
         except Exception as notify_e:
-            logger.error(f"通知用戶失敗：{notify_e}")
+            logger.error(f"通知管理員失敗：{notify_e}")
         raise
     finally:
         for resp in [r for r in locals().values() if isinstance(r, requests.Response)]:
@@ -519,10 +536,10 @@ def run_event_loop():
         logger.error(f"事件循環異常停止：{e}\n{traceback.format_exc()}")
         try:
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            data = {"chat_id": chat_id, "text": f"事件循環異常：{str(e)}"}
+            data = {"chat_id": ADMIN_CHAT_ID, "text": f"事件循環異常：{str(e)}"}
             session.post(url, json=data, timeout=5).close()
         except Exception as notify_e:
-            logger.error(f"通知用戶失敗：{notify_e}")
+            logger.error(f"通知管理員失敗：{notify_e}")
     finally:
         logger.info("關閉事件循環")
         pending = asyncio.all_tasks(loop)
@@ -588,7 +605,7 @@ if __name__ == "__main__":
         logger.error(f"主程式異常：{e}\n{traceback.format_exc()}")
         try:
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            data = {"chat_id": chat_id, "text": f"主程式異常：{str(e)}"}
+            data = {"chat_id": ADMIN_CHAT_ID, "text": f"主程式異常：{str(e)}"}
             session.post(url, json=data, timeout=5).close()
         except Exception as notify_e:
-            logger.error(f"通知用戶失敗：{notify_e}")
+            logger.error(f"通知管理員失敗：{notify_e}")
