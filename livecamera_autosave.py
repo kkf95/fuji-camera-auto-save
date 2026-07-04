@@ -15,6 +15,7 @@ import time
 import psutil
 import signal
 import platform
+from urllib.parse import urlparse
 
 # 設置日誌
 logging.basicConfig(
@@ -30,8 +31,10 @@ logger = logging.getLogger(__name__)
 # 從環境變數獲取 Telegram Bot Token 和 Webhook URL
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-DEFAULT_PAGE_URL = "https://live.fujigoko.tv/?n=26&b=0"
-DEFAULT_IMAGE_URL = "https://cam.fujigoko.tv/livecam26/cam1_9892.jpg"
+
+# 更新為新的預設網址
+DEFAULT_PAGE_URL = "https://fujiyama.tv/live/?n=26&b=0"
+DEFAULT_IMAGE_URL = "https://fujiyama.tv/live/camimg.php?n=26&img=cam.jpg"
 DEFAULT_LOCATION = "鳴沢村活き活き広場"
 
 # 用於控制任務和儲存網址的全局變數
@@ -40,7 +43,7 @@ task = None
 user_page_url = DEFAULT_PAGE_URL
 loop = None
 last_task_check = 0
-chat_id = 48732810
+chat_id = 48732810  # 您的 Chat ID
 session = requests.Session()
 last_image_url = None
 run_event = None
@@ -114,10 +117,42 @@ async def get_latest_image_url(page_url):
         response = session.get(page_url, timeout=5)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
+        
+        # 1. 獲取圖片網址：優先找 img#mov，若無則尋找 meta 標籤
         img_tag = soup.find("img", id="mov")
-        image_url = img_tag["src"] if img_tag and img_tag.get("src") else DEFAULT_IMAGE_URL
+        if img_tag and img_tag.get("src"):
+            image_url = img_tag["src"]
+        else:
+            meta_img = soup.find("meta", property="og:image")
+            if meta_img and meta_img.get("content"):
+                image_url = meta_img["content"]
+            else:
+                image_url = DEFAULT_IMAGE_URL
+                
+        # 處理相對路徑 (例如 /live/camimg.php...)
+        if image_url.startswith("/"):
+            parsed_url = urlparse(page_url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            image_url = f"{base_url}{image_url}"
+        elif not image_url.startswith("http"):
+            image_url = DEFAULT_IMAGE_URL
+            
+        # 2. 獲取地點名稱
         location_tag = soup.find("span", class_="auto-style3")
-        location = location_tag.text.strip().replace("/ ", "") if location_tag else DEFAULT_LOCATION
+        if location_tag:
+            location = location_tag.text.strip().replace("/ ", "")
+        else:
+            # 備用方案：從 Title 提取 (格式如: 富士山ライブカメラ-鳴沢村活き活き広場 | ...)
+            title_tag = soup.find("title")
+            if title_tag:
+                title_text = title_tag.text
+                if "-" in title_text and "|" in title_text:
+                    location = title_text.split("-")[1].split("|")[0].strip()
+                else:
+                    location = DEFAULT_LOCATION
+            else:
+                location = DEFAULT_LOCATION
+                
         logger.info(f"成功爬取圖片網址：{image_url}，地點：{location}，耗時：{time.time() - start_time:.2f}s")
         return image_url, location
     except Exception as e:
@@ -142,9 +177,13 @@ def seturl(update: Update, context: CallbackContext):
         response = session.get(new_url, timeout=5)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
+        
+        # 相容新舊版本的圖片檢查
         img_tag = soup.find("img", id="mov")
-        if not img_tag or not img_tag.get("src"):
-            update.message.reply_text("該網址無效，無法找到圖片（<img id='mov'>）！")
+        meta_img = soup.find("meta", property="og:image")
+        
+        if not (img_tag and img_tag.get("src")) and not (meta_img and meta_img.get("content")):
+            update.message.reply_text("該網址無效，無法找到圖片來源！")
             return
     except Exception as e:
         update.message.reply_text(f"錯誤：無法訪問網址 ({str(e)})")
@@ -226,20 +265,29 @@ async def send_images():
                 break
             logger.info("進入圖片傳送迴圈")
             last_task_check = time.time()
+            
             current_url, location = await get_latest_image_url(user_page_url)
             if current_url != last_image_url:
                 last_image_url = current_url
                 logger.info(f"圖片網址已更新：{current_url}")
             else:
                 logger.info(f"圖片網址未變：{current_url}")
-            request_url = f"{current_url.split('?')[0]}?{int(asyncio.get_event_loop().time() * 1000)}"
+                
+            # 修正 URL Cache-Buster：保留原本的 GET 參數 (如 n=26&img=cam.jpg)
+            if "?" in current_url:
+                request_url = f"{current_url}&_t={int(time.time() * 1000)}"
+            else:
+                request_url = f"{current_url}?_t={int(time.time() * 1000)}"
+                
             logger.info(f"請求圖片網址：{request_url}")
             request_start = time.time()
             response = session.get(request_url, timeout=5)
             logger.info(f"圖片請求耗時：{time.time() - request_start:.2f}s")
+            
             if response.status_code == 200:
                 jst_time = datetime.now(ZoneInfo("Asia/Tokyo"))
-                caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: 富士五湖TV)"
+                # Source 名稱已變更為 Fujiyama.TV
+                caption = f"{jst_time.strftime('%Y-%m-%d JST %H:%M')} {location} (Source: Fujiyama.TV)"
                 logger.info(f"準備傳送圖片，caption：{caption}")
                 telegram_start = time.time()
                 url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
@@ -256,6 +304,7 @@ async def send_images():
             else:
                 logger.warning(f"無法下載圖片，網址：{request_url}，狀態碼：{response.status_code}")
                 response.close()
+                
             process = psutil.Process()
             mem_info = process.memory_info()
             cpu_percent = psutil.cpu_percent(interval=None)
@@ -394,7 +443,6 @@ def initialize_bot():
         run_event = asyncio.Event()
         running = load_running_state()
         logger.info(f"載入 running 狀態：{running}")
-        # 記錄環境變數和系統資訊
         env_vars = {k: "****" if k in ["TELEGRAM_BOT_TOKEN", "GITHUB_TOKEN", "GITHUB_ACCESS_TOKEN"] else v for k, v in os.environ.items()}
         logger.info(f"環境變數：{env_vars}")
         logger.info(f"系統資訊：Python {sys.version}, Platform {platform.platform()}, CPUs {psutil.cpu_count()}")
